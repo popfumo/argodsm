@@ -15,6 +15,7 @@
 #include "env/env.hpp"
 #include "signal/signal.hpp"
 #include "virtual_memory/virtual_memory.hpp"
+#include "mempools/cxl_l2.hpp"
 
 namespace dd = argo::data_distribution;
 namespace vm = argo::virtual_memory;
@@ -47,6 +48,11 @@ argo_byte * touchedcache;
 char* cacheData;
 /** @brief Copy of the local cache to keep twinpages for later being able to DIFF stores */
 char * pagecopy;
+/** @brief  Local L2 cacheData */
+char* l2CacheData;
+
+argo::cxl_l2::l2_control_data* l2ControlData;
+
 /** @brief Pointer to locks protecting the page cache */
 std::vector<cache_lock> cache_locks;
 /** @brief Mutex ensuring that only one thread can perform node-wide synchronization */
@@ -97,6 +103,8 @@ std::size_t size_of_chunk;
 std::uintptr_t GLOBAL_NULL;
 /** @brief  Statistics */
 argo_statistics stats;
+
+l2_stats l2_statistics;
 
 /*First-Touch policy*/
 /** @brief  Holds the owner and backing offset of a page */
@@ -278,11 +286,17 @@ void load_cache_entry(std::uintptr_t aligned_access_offset) {
 
 		if(cache_locks[idx].try_lock() || idx == start_index) {
 			/* Skip updating pages that are already present and valid in the cache */
+			/* Here we need to check if it's in L2 */
 			if(cacheControl[idx].tag == temp_addr && cacheControl[idx].state != INVALID) {
 				pages_to_load[p] = false;
 				cache_locks[idx].unlock();
 				continue;
-			} else {
+			} 
+			// else if(argo::cxl_l2::l2_lookup)
+			// {
+			// 	// do stuff
+			// }
+			else {
 				pages_to_load[p] = true;
 			}
 		} else {
@@ -291,11 +305,19 @@ void load_cache_entry(std::uintptr_t aligned_access_offset) {
 		}
 
 		/* If another page occupies the cache index, begin to evict it. */
+		/* L2 cache implementation point */ 
+		/* If another page has the cache index, downgrade it to L2 instead*/
+		printf("Loading page at addr %lu into cache index %lu\n", temp_addr, idx);
 		if((cacheControl[idx].tag != temp_addr) && (cacheControl[idx].tag != GLOBAL_NULL)) {
 			void* old_ptr = static_cast<char*>(startAddr) + cacheControl[idx].tag;
 			void* temp_ptr = static_cast<char*>(startAddr) + temp_addr;
+			argo::cxl_l2::l2_insert(*l2ControlData, l2CacheData, &cacheData[PAGE_SIZE*idx]);
+			l2_statistics.inserts.fetch_add(1);
+			l2_statistics.bytes_l1_to_l2.fetch_add(PAGE_SIZE*CACHELINE);
 
 			/* If the page is dirty, write it back */
+			/* Downgrade the page to L2 first */
+			/* Also need to add some extra logic checking if its inside L2 cache */
 			if(cacheControl[idx].dirty == DIRTY) {
 				mprotect(old_ptr, block_size, PROT_READ);
 				for(std::size_t j = 0; j < CACHELINE; j++) {
@@ -756,6 +778,7 @@ void argo_initialize(std::size_t argo_size, std::size_t cache_size) {
 	load_size = env::load_size();
 	/** Limit cache_size to at most argo_size */
 	cachesize = std::min(argo_size, cache_size);
+	cachesize = 16;
 	/** Round the number of cache pages upwards */
 	cachesize = align_forwards(cachesize, PAGE_SIZE*CACHELINE);
 	/** At least two pages are required to prevent endless eviction loops */
@@ -790,6 +813,16 @@ void argo_initialize(std::size_t argo_size, std::size_t cache_size) {
 	globalData = static_cast<char*>(vm::allocate_mappable(PAGE_SIZE, size_of_chunk));
 	cacheData = static_cast<char*>(vm::allocate_mappable(PAGE_SIZE, cachesize*PAGE_SIZE));
 	cacheControl = static_cast<control_data*>(vm::allocate_mappable(PAGE_SIZE, cacheControlSize));
+
+	std::size_t l2CacheControlSize = sizeof(argo::cxl_l2::l2_control_data) * 1024;
+
+	l2ControlData = argo::cxl_l2::l2_control_init(l2CacheControlSize);
+
+	l2CacheData = argo::cxl_l2::l2Data_init(1024 * PAGE_SIZE);
+	if(!l2CacheData) {
+		printf("L2 cache initialization failed\n");
+		exit(EXIT_FAILURE);
+	}
 
 	touchedcache = static_cast<argo_byte*>(malloc(cachesize));
 	if(touchedcache == NULL) {
@@ -1379,6 +1412,10 @@ void print_statistics() {
 				printf("#  write misses: %11lu    access time: %12.4fs\n",
 						stats.write_misses.load(), stats.store_time);
 
+				printf( "\n");
+				printf("#  " CYN "# L2 cache\n" RESET);
+				printf("#  Inserts: %15lu, Total bytes copied: %15lu\n", l2_statistics.inserts.load(), l2_statistics.bytes_l1_to_l2.load());
+				printf("\n");
 				/* Print coherence info */
 				printf("#  " CYN "# Coherence actions\n" RESET);
 				printf("#  locks held: %13d    barriers passed: %8lu    barrier time: %11.4fs\n",

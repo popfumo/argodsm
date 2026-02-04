@@ -69,6 +69,7 @@ typedef struct myControlData {
 		argo_byte dirty;     // is this locally dirty?
 		/** @brief Tracks address of page */
 		std::uintptr_t tag;  // address of global page in distr memory
+		bool inL2Cache = false; // is this page in L2 cache?
 } control_data;
 
 /** @brief Struct containing statistics */
