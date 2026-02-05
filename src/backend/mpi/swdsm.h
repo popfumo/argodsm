@@ -69,7 +69,6 @@ typedef struct myControlData {
 		argo_byte dirty;     // is this locally dirty?
 		/** @brief Tracks address of page */
 		std::uintptr_t tag;  // address of global page in distr memory
-		bool inL2Cache = false; // is this page in L2 cache?
 } control_data;
 
 /** @brief Struct containing statistics */
@@ -110,6 +109,8 @@ typedef struct argo_statistics_struct {
 		double ssd_time;
 		/** @brief Mutex to update ssd_time */
 		std::mutex ssd_time_mutex;
+		std::atomic<std::size_t> remote_pages_loaded;
+		std::atomic<std::size_t> remote_pages_evicted;
 } argo_statistics;
 
 /**

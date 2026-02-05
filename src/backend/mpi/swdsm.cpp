@@ -50,6 +50,8 @@ char* cacheData;
 char * pagecopy;
 /** @brief  Local L2 cacheData */
 char* l2CacheData;
+/** @brief  Number of entries in the L2 cache */
+std::size_t l2CacheEntries;
 
 argo::cxl_l2::l2_control_data* l2ControlData;
 
@@ -283,7 +285,7 @@ void load_cache_entry(std::uintptr_t aligned_access_offset) {
 	for(std::size_t idx = start_index, p = 0; idx < end_index; idx+=CACHELINE, p+=CACHELINE) {
 		/* Address and pointer to the data being loaded */
 		const std::size_t temp_addr = aligned_access_offset + p*block_size;
-
+		std::size_t l2_idx;
 		if(cache_locks[idx].try_lock() || idx == start_index) {
 			/* Skip updating pages that are already present and valid in the cache */
 			/* Here we need to check if it's in L2 */
@@ -292,12 +294,12 @@ void load_cache_entry(std::uintptr_t aligned_access_offset) {
 				cache_locks[idx].unlock();
 				continue;
 			} 
-			// else if(argo::cxl_l2::l2_lookup)
-			// {
-			// 	// do stuff
-			// }
 			else {
 				pages_to_load[p] = true;
+			}
+			if(argo::cxl_l2::l2_lookup(l2ControlData, l2CacheEntries, temp_addr, l2_idx, workrank))
+			{
+				printf("Node %d L2 Hit", workrank);
 			}
 		} else {
 			pages_to_load[p] = false;
@@ -311,7 +313,7 @@ void load_cache_entry(std::uintptr_t aligned_access_offset) {
 		if((cacheControl[idx].tag != temp_addr) && (cacheControl[idx].tag != GLOBAL_NULL)) {
 			void* old_ptr = static_cast<char*>(startAddr) + cacheControl[idx].tag;
 			void* temp_ptr = static_cast<char*>(startAddr) + temp_addr;
-			argo::cxl_l2::l2_insert(*l2ControlData, l2CacheData, &cacheData[PAGE_SIZE*idx]);
+			argo::cxl_l2::l2_insert(l2ControlData, l2CacheEntries, l2CacheData, cacheControl[idx].tag, &cacheData[PAGE_SIZE * idx], (cacheControl[idx].dirty == DIRTY), workrank);
 			l2_statistics.inserts.fetch_add(1);
 			l2_statistics.bytes_l1_to_l2.fetch_add(PAGE_SIZE*CACHELINE);
 
@@ -814,11 +816,10 @@ void argo_initialize(std::size_t argo_size, std::size_t cache_size) {
 	cacheData = static_cast<char*>(vm::allocate_mappable(PAGE_SIZE, cachesize*PAGE_SIZE));
 	cacheControl = static_cast<control_data*>(vm::allocate_mappable(PAGE_SIZE, cacheControlSize));
 
-	std::size_t l2CacheControlSize = sizeof(argo::cxl_l2::l2_control_data) * 1024;
-
-	l2ControlData = argo::cxl_l2::l2_control_init(l2CacheControlSize);
-
-	l2CacheData = argo::cxl_l2::l2Data_init(1024 * PAGE_SIZE);
+	/* Initialize L2 cache */
+	l2CacheEntries = 1024;
+	l2ControlData = argo::cxl_l2::l2_control_init(l2CacheEntries);
+	l2CacheData = argo::cxl_l2::l2Data_init(l2CacheEntries * PAGE_SIZE * CACHELINE);
 	if(!l2CacheData) {
 		printf("L2 cache initialization failed\n");
 		exit(EXIT_FAILURE);

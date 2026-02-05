@@ -11,6 +11,7 @@
 #include <numa.h>
 #include <numaif.h>
 #include "backend/mpi/swdsm.h"
+
 class l2_stats
 {
 public:
@@ -42,124 +43,269 @@ namespace argo
             argo_byte state;
             /** @brief Dirty bit of the cache line */
             argo_byte dirty;
-            /** @brief Tag of the cache line */
+            /** @brief Tag of the cache line - stores the aligned global address */
             std::uintptr_t tag;
-            std::size_t size = 0;
-            std::size_t pos = 0;
         };
 
-        struct cxl_l2_info
+        /**
+         * @brief Get the L2 cache index for a given aligned address
+         * @param aligned_addr The aligned global address (must be aligned to PAGE_SIZE*CACHELINE)
+         * @param l2_entries Total number of entries in the L2 cache
+         * @return The cache index
+         */
+        inline std::size_t getL2CacheIndex(std::uintptr_t aligned_addr, std::size_t l2_entries)
         {
-            void *base = nullptr;
-            std::size_t size = 0;
-            std::size_t pos = 0;
-        };
+            const std::size_t block_size = PAGE_SIZE * CACHELINE;
+            return (aligned_addr / block_size) % l2_entries;
+        }
 
-        // Current plan: Just allocate fixed memory for L2 cache on the cxl memory module (numa node 2)
-        // and then write some data to it when evicting from L1 cache.
-
-        l2_control_data *l2_control_init(std::size_t size)
+        /**
+         * @brief Initialize L2 control data array on CXL memory (NUMA node 2)
+         * @param num_entries Number of cache entries to allocate
+         * @return Pointer to the allocated control array
+         */
+        l2_control_data *l2_control_init(std::size_t num_entries)
         {
-            void *ptr = numa_alloc_onnode(size * sizeof(l2_control_data), 2);
+            void *ptr = numa_alloc_onnode(num_entries * sizeof(l2_control_data), 2);
             if (!ptr)
             {
                 throw std::runtime_error("Failed to allocate CXL L2 cache control memory");
             }
-            memset(ptr, 0, size * sizeof(l2_control_data));
-            static_cast<l2_control_data *>(ptr)->size = size;
-            return static_cast<l2_control_data *>(ptr);
+            memset(ptr, 0, num_entries * sizeof(l2_control_data));
+
+            // Initialize all entries to INVALID
+            l2_control_data *controls = static_cast<l2_control_data *>(ptr);
+            for (std::size_t i = 0; i < num_entries; ++i)
+            {
+                controls[i].state = INVALID;
+                controls[i].dirty = CLEAN;
+                controls[i].tag = 0;
+            }
+
+            printf("L2 control initialized with %zu entries (%zu bytes)\n",
+                   num_entries, num_entries * sizeof(l2_control_data));
+            return controls;
         }
 
-        char *l2Data_init(std::size_t size)
+        /**
+         * @brief Initialize L2 data array on CXL memory (NUMA node 2)
+         * @param size_bytes Total size in bytes for L2 cache data
+         * @return Pointer to the allocated data array
+         */
+        char *l2Data_init(std::size_t size_bytes)
         {
-            void *ptr = numa_alloc_onnode(size, 2);
+            void *ptr = numa_alloc_onnode(size_bytes, 2);
             if (!ptr)
             {
-                throw std::runtime_error("Failed to allocate CXL L2 cache memory");
+                throw std::runtime_error("Failed to allocate CXL L2 cache data memory");
             }
-            memset(ptr, 0, size);
-            printf("L2 cache initialized with size %lu bytes\n", (unsigned long)size);
-
+            memset(ptr, 0, size_bytes);
+            printf("L2 data cache initialized with %zu bytes\n", size_bytes);
             return static_cast<char *>(ptr);
         }
 
-        cxl_l2_info *l2_init(std::size_t size)
-        {
-            void *ptr = numa_alloc_onnode(size, 2);
-            if (!ptr)
-            {
-                throw std::runtime_error("Failed to allocate CXL L2 cache memory");
-            }
-            memset(ptr, 0, size);
-
-            return new cxl_l2_info{ptr, size, 0};
-        }
-
+        /**
+         * @brief Free L2 cache memory
+         * @param ptr Pointer to the allocated memory
+         * @param size Size of the allocated memory
+         */
         void l2_free(void *ptr, std::size_t size)
         {
             numa_free(ptr, size);
         }
 
-        void l2_insert(l2_control_data &l2_control, char *l2_data, void *page_src)
+        /**
+         * @brief Look up a page in the L2 cache
+         * @param l2_controls Pointer to the L2 control data array
+         * @param num_entries Total number of entries in the L2 cache
+         * @param aligned_addr The aligned global address to look up
+         * @param index_out Output parameter for the cache index if found
+         * @return true if page is in L2 and valid, false otherwise
+         */
+        bool l2_lookup(l2_control_data *l2_controls, std::size_t num_entries,
+                       std::uintptr_t aligned_addr, std::size_t &index_out, int workrank)
         {
-            // Insert page into L2 cache
-            // When page is inserted, move pointer forward in circular manner
-            // If no space left, evict oldest page (just overwrite it for now)
+            assert(l2_controls != nullptr);
 
-            // need to somehow check where to write, meaning we need to find the current offset in L2 cache
+            std::size_t idx = getL2CacheIndex(aligned_addr, num_entries);
 
-            // Insert a page at the current position
-            // need to introduce some sort of tag that tells where the page is stored in L2 cache
-            assert(l2_data != nullptr);
-            assert(page_src != nullptr);
-            assert(l2_control.pos + PAGE_SIZE <= l2_control.size);
-            printf("Inserting page into L2 cache at position %zu, address %p\n", l2_control.pos, l2_data + l2_control.pos);
-            printf("Page source address: %p\n", page_src);
-            void *dest = l2_data + l2_control.pos;
-            memcpy(dest, page_src, PAGE_SIZE);
-            printf("Page copied to L2 cache at address %p\n", dest);
-            l2_control.tag = reinterpret_cast<std::uintptr_t>(dest);
-            l2_control.state = VALID;
-            l2_control.dirty = CLEAN;
-            // Move position forward
-            l2_control.pos += PAGE_SIZE;
-            if (l2_control.pos >= l2_control.size)
-            {
-                l2_control.pos = 0; // Wrap around to start
-            }
-        }
-
-        void *l2_get_page(l2_control_data &l2_control, char *l2_data, std::size_t offset)
-        {
-            // Get page from L2 cache at given offset
-            assert(l2_data != nullptr);
-            assert(offset + PAGE_SIZE <= l2_control.size);
-
-            void *src = static_cast<char *>(l2_data) + offset;
-            return src;
-        }
-
-        void l2_extract(cxl_l2_info &l2, void *page_dest, std::size_t tag)
-        {
-            // Extract page from L2 cache to destination
-            // Need to know where pages are stored, input is global address tag
-            assert(page_dest != nullptr);
-            assert(l2.base != nullptr);
-            std::size_t offset = tag % l2.size; // Simple mapping for demonstration
-            printf("Extracting page from L2 cache at offset %zu to destination %p\n", offset, page_dest);
-            void *src = static_cast<char *>(l2.base) + offset;
-            memcpy(page_dest, src, PAGE_SIZE);
-        }
-
-        bool l2_lookup(l2_control_data *controls, std::size_t entries, std::uintptr_t tag, std::size_t &index_out)
-        {
-            std::size_t idx = (tag / PAGE_SIZE) % entries;
-            if (controls[idx].tag == tag && controls[idx].state == VALID)
+            if (l2_controls[idx].tag == aligned_addr && l2_controls[idx].state == VALID)
             {
                 index_out = idx;
+                printf("Node %d L2 cache HIT for addr %lu at index %zu\n", workrank, aligned_addr, idx);
+                return true;
+            }
+
+            printf("Node %d L2 cache MISS for addr %lu at index %zu (tag=%lu, state=%d)\n", workrank,
+                   aligned_addr, idx, l2_controls[idx].tag, l2_controls[idx].state);
+            return false;
+        }
+
+        /**
+         * @brief Insert a page into the L2 cache
+         * @param l2_controls Pointer to the L2 control data array
+         * @param num_entries Total number of entries in the L2 cache
+         * @param l2_data Pointer to the L2 data array
+         * @param aligned_addr The aligned global address being inserted
+         * @param page_src Pointer to the source data (L1 cache entry)
+         * @param is_dirty Whether the page is dirty
+         */
+        void l2_insert(l2_control_data *l2_controls, std::size_t num_entries,
+                       char *l2_data, std::uintptr_t aligned_addr,
+                       void *page_src, bool is_dirty, int workrank)
+        {
+            assert(l2_controls != nullptr);
+            assert(l2_data != nullptr);
+            assert(page_src != nullptr);
+            const std::size_t block_size = PAGE_SIZE * CACHELINE;
+
+            std::size_t idx = getL2CacheIndex(aligned_addr, num_entries);
+
+            // If evicting an existing valid entry, count it
+            if (l2_controls[idx].state == VALID && l2_controls[idx].tag != aligned_addr)
+            {
+                printf("Node %d L2 evicting addr %lu from index %zu to make room for %lu\n", workrank,
+                       l2_controls[idx].tag, idx, aligned_addr);
+            }
+
+            // Copy the cache block (CACHELINE pages) to L2
+            void *dest = l2_data + (idx * block_size);
+            memcpy(dest, page_src, block_size);
+
+            // Update control data
+            l2_controls[idx].tag = aligned_addr;
+            l2_controls[idx].state = VALID;
+            l2_controls[idx].dirty = is_dirty ? DIRTY : CLEAN;
+
+            printf("Node %d L2 inserted addr %lu at index %zu (dest=%p)\n", workrank, aligned_addr, idx, dest);
+        }
+
+        /**
+         * @brief Extract a page from L2 cache back to L1
+         * @param l2_controls Pointer to the L2 control data array
+         * @param num_entries Total number of entries in the L2 cache
+         * @param l2_data Pointer to the L2 data array
+         * @param aligned_addr The aligned global address to extract
+         * @param page_dest Destination pointer (L1 cache entry)
+         * @return true if successfully extracted, false if not found
+         */
+        bool l2_extract(l2_control_data *l2_controls, std::size_t num_entries,
+                        char *l2_data, std::uintptr_t aligned_addr, void *page_dest, int workrank)
+        {
+            assert(l2_controls != nullptr);
+            assert(l2_data != nullptr);
+            assert(page_dest != nullptr);
+            const std::size_t block_size = PAGE_SIZE * CACHELINE;
+
+            std::size_t idx;
+            if (!l2_lookup(l2_controls, num_entries, aligned_addr, idx, workrank))
+            {
+                printf("L2 extract failed: addr %lu not found\n", aligned_addr);
+                return false;
+            }
+
+            // Copy the cache block from L2 to destination
+            void *src = l2_data + (idx * block_size);
+            memcpy(page_dest, src, block_size);
+
+            printf("L2 extracted addr %lu from index %zu to dest %p\n", aligned_addr, idx, page_dest);
+            return true;
+        }
+
+        /**
+         * @brief Check if inserting at aligned_addr would require evicting a valid entry
+         * @param l2_controls Pointer to the L2 control data array
+         * @param num_entries Total number of entries in the L2 cache
+         * @param aligned_addr The aligned global address to be inserted
+         * @param victim_addr Output: the address of the victim entry (if any)
+         * @param victim_dirty Output: whether the victim is dirty
+         * @return true if eviction is needed (valid entry with different tag exists)
+         */
+        bool l2_needs_eviction(l2_control_data *l2_controls, std::size_t num_entries,
+                               std::uintptr_t aligned_addr, std::uintptr_t &victim_addr,
+                               bool &victim_dirty)
+        {
+            assert(l2_controls != nullptr);
+
+            std::size_t idx = getL2CacheIndex(aligned_addr, num_entries);
+
+            if (l2_controls[idx].state == VALID && l2_controls[idx].tag != aligned_addr)
+            {
+                victim_addr = l2_controls[idx].tag;
+                victim_dirty = (l2_controls[idx].dirty == DIRTY);
                 return true;
             }
             return false;
+        }
+
+        /**
+         * @brief Get L2 cache data pointer for a given index
+         * @param l2_data Pointer to the L2 data array
+         * @param num_entries Total number of entries in the L2 cache
+         * @param aligned_addr The aligned global address
+         * @return Pointer to the cache data for that index
+         */
+        void *l2_get_data_ptr(char *l2_data, std::size_t num_entries, std::uintptr_t aligned_addr)
+        {
+            const std::size_t block_size = PAGE_SIZE * CACHELINE;
+            std::size_t idx = getL2CacheIndex(aligned_addr, num_entries);
+            return l2_data + (idx * block_size);
+        }
+
+        /**
+         * @brief Mark L2 entry as clean after writeback
+         * @param l2_controls Pointer to the L2 control data array
+         * @param num_entries Total number of entries in the L2 cache
+         * @param aligned_addr The aligned global address
+         */
+        void l2_mark_clean(l2_control_data *l2_controls, std::size_t num_entries,
+                           std::uintptr_t aligned_addr)
+        {
+            assert(l2_controls != nullptr);
+            std::size_t idx = getL2CacheIndex(aligned_addr, num_entries);
+
+            if (l2_controls[idx].tag == aligned_addr && l2_controls[idx].state == VALID)
+            {
+                l2_controls[idx].dirty = CLEAN;
+            }
+        }
+
+        /**
+         * @brief Get dirty status of an L2 entry
+         * @param l2_controls Pointer to the L2 control data array
+         * @param num_entries Total number of entries in the L2 cache
+         * @param aligned_addr The aligned global address
+         * @return true if entry is valid and dirty
+         */
+        bool l2_is_dirty(l2_control_data *l2_controls, std::size_t num_entries,
+                         std::uintptr_t aligned_addr)
+        {
+            assert(l2_controls != nullptr);
+            std::size_t idx = getL2CacheIndex(aligned_addr, num_entries);
+
+            return (l2_controls[idx].tag == aligned_addr &&
+                    l2_controls[idx].state == VALID &&
+                    l2_controls[idx].dirty == DIRTY);
+        }
+
+        /**
+         * @brief Invalidate an L2 cache entry
+         * @param l2_controls Pointer to the L2 control data array
+         * @param num_entries Total number of entries in the L2 cache
+         * @param aligned_addr The aligned global address to invalidate
+         */
+        void l2_invalidate(l2_control_data *l2_controls, std::size_t num_entries,
+                           std::uintptr_t aligned_addr)
+        {
+            assert(l2_controls != nullptr);
+
+            std::size_t idx = getL2CacheIndex(aligned_addr, num_entries);
+
+            if (l2_controls[idx].tag == aligned_addr && l2_controls[idx].state == VALID)
+            {
+                l2_controls[idx].state = INVALID;
+                printf("L2 invalidated addr %lu at index %zu\n", aligned_addr, idx);
+            }
         }
 
     }
