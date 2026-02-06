@@ -21,6 +21,8 @@ public:
     std::atomic<std::size_t> evictions{0};
     std::atomic<std::size_t> bytes_l1_to_l2{0};
     std::atomic<std::size_t> bytes_l2_to_l1{0};
+    std::atomic<std::size_t> remote_pages_inserted{0};
+    std::atomic<std::size_t> remote_pages_evicted{0};
     void l2_reset_stats()
     {
         hits.store(0, std::memory_order_relaxed);
@@ -29,6 +31,8 @@ public:
         evictions.store(0, std::memory_order_relaxed);
         bytes_l1_to_l2.store(0, std::memory_order_relaxed);
         bytes_l2_to_l1.store(0, std::memory_order_relaxed);
+        remote_pages_inserted.store(0, std::memory_order_relaxed);
+        remote_pages_evicted.store(0, std::memory_order_relaxed);
     }
 };
 

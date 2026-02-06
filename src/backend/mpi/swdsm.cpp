@@ -281,6 +281,7 @@ void load_cache_entry(std::uintptr_t aligned_access_offset) {
 	/* Temporarily store remotely fetched cache data */
 	std::vector<char> temp_data(fetch_size*PAGE_SIZE);
 
+
 	/* Write back existing cache entries if needed */
 	for(std::size_t idx = start_index, p = 0; idx < end_index; idx+=CACHELINE, p+=CACHELINE) {
 		/* Address and pointer to the data being loaded */
@@ -299,7 +300,38 @@ void load_cache_entry(std::uintptr_t aligned_access_offset) {
 			}
 			if(argo::cxl_l2::l2_lookup(l2ControlData, l2CacheEntries, temp_addr, l2_idx, workrank))
 			{
-				printf("Node %d L2 Hit", workrank);
+				l2_statistics.hits.fetch_add(1);
+				
+				// Extract directly to L1 cache
+				argo::cxl_l2::l2_extract(l2ControlData, l2CacheEntries, l2CacheData, temp_addr, &cacheData[PAGE_SIZE * idx], workrank);
+				l2_statistics.bytes_l2_to_l1.fetch_add(PAGE_SIZE*CACHELINE);
+				
+				bool l2_was_dirty = argo::cxl_l2::l2_is_dirty(l2ControlData, l2CacheEntries, temp_addr);
+				
+				void *temp_ptr = static_cast<char *>(startAddr) + temp_addr;
+				if (cacheControl[idx].tag == GLOBAL_NULL) {
+					vm::map_memory(temp_ptr, block_size, PAGE_SIZE * idx, PROT_READ);
+				} else {
+					mprotect(temp_ptr, block_size, PROT_READ);
+				}
+				
+				cacheControl[idx].tag = temp_addr;
+				cacheControl[idx].state = VALID;
+				cacheControl[idx].dirty = l2_was_dirty ? DIRTY : CLEAN;
+				touchedcache[idx] = 1;
+				
+				// Don't need to load from remote
+				pages_to_load[p] = false;
+				l2_statistics.hits.fetch_add(1);
+				l2_statistics.bytes_l2_to_l1.fetch_add(PAGE_SIZE);
+				if (idx != start_index) {
+					cache_locks[idx].unlock();
+				}
+				continue;
+			}
+			else
+			{
+				l2_statistics.misses.fetch_add(1);
 			}
 		} else {
 			pages_to_load[p] = false;
@@ -309,14 +341,46 @@ void load_cache_entry(std::uintptr_t aligned_access_offset) {
 		/* If another page occupies the cache index, begin to evict it. */
 		/* L2 cache implementation point */ 
 		/* If another page has the cache index, downgrade it to L2 instead*/
-		printf("Loading page at addr %lu into cache index %lu\n", temp_addr, idx);
 		if((cacheControl[idx].tag != temp_addr) && (cacheControl[idx].tag != GLOBAL_NULL)) {
 			void* old_ptr = static_cast<char*>(startAddr) + cacheControl[idx].tag;
 			void* temp_ptr = static_cast<char*>(startAddr) + temp_addr;
-			argo::cxl_l2::l2_insert(l2ControlData, l2CacheEntries, l2CacheData, cacheControl[idx].tag, &cacheData[PAGE_SIZE * idx], (cacheControl[idx].dirty == DIRTY), workrank);
-			l2_statistics.inserts.fetch_add(1);
-			l2_statistics.bytes_l1_to_l2.fetch_add(PAGE_SIZE*CACHELINE);
+			std::uintptr_t l2_victim_addr;
+			bool l2_victim_dirty;
+			if (argo::cxl_l2::l2_needs_eviction(l2ControlData, l2CacheEntries,
+					cacheControl[idx].tag, l2_victim_addr, l2_victim_dirty))
+			{
+				if (l2_victim_dirty)
+				{
+					// Write back dirty L2 victim to remote memory
+					void *l2_data = argo::cxl_l2::l2_get_data_ptr(l2CacheData, l2CacheEntries, l2_victim_addr);
+					for (std::size_t j = 0; j < CACHELINE; j++)
+					{
+						const argo::node_id_t victim_homenode = get_homenode(l2_victim_addr + j * PAGE_SIZE);
+						const std::size_t victim_offset = get_offset(l2_victim_addr + j * PAGE_SIZE);
+						const std::size_t victim_win_index = get_data_win_index(victim_offset);
+						const std::size_t victim_win_offset = get_data_win_offset(victim_offset);
+						mpi_lock_data[victim_win_index][victim_homenode].lock(MPI_LOCK_EXCLUSIVE,
+							victim_homenode, data_windows[victim_win_index][victim_homenode]);
+						MPI_Put(static_cast<char *>(l2_data) + j * PAGE_SIZE, PAGE_SIZE, MPI_BYTE,
+							victim_homenode, victim_win_offset, PAGE_SIZE, MPI_BYTE,
+							data_windows[victim_win_index][victim_homenode]);
+						mpi_lock_data[victim_win_index][victim_homenode].unlock(
+							victim_homenode, data_windows[victim_win_index][victim_homenode]);
+					}
+				}
+				l2_statistics.evictions.fetch_add(1); // Should always be more than or equal to remote page evictions
+				if(workrank != get_homenode(cacheControl[idx].tag)) 
+				{
+					l2_statistics.remote_pages_evicted.fetch_add(1);
+				}
+			}
 
+			argo::cxl_l2::l2_insert(l2ControlData, l2CacheEntries, l2CacheData, cacheControl[idx].tag, &cacheData[PAGE_SIZE * idx], (cacheControl[idx].dirty == DIRTY), workrank);
+			l2_statistics.bytes_l1_to_l2.fetch_add(PAGE_SIZE);
+			l2_statistics.inserts.fetch_add(1); // should also be more than or equal to remote page inserts
+			if(workrank != get_homenode(temp_addr)) {
+				l2_statistics.remote_pages_inserted.fetch_add(1);
+			}
 			/* If the page is dirty, write it back */
 			/* Downgrade the page to L2 first */
 			/* Also need to add some extra logic checking if its inside L2 cache */
@@ -780,7 +844,6 @@ void argo_initialize(std::size_t argo_size, std::size_t cache_size) {
 	load_size = env::load_size();
 	/** Limit cache_size to at most argo_size */
 	cachesize = std::min(argo_size, cache_size);
-	cachesize = 16;
 	/** Round the number of cache pages upwards */
 	cachesize = align_forwards(cachesize, PAGE_SIZE*CACHELINE);
 	/** At least two pages are required to prevent endless eviction loops */
@@ -817,7 +880,7 @@ void argo_initialize(std::size_t argo_size, std::size_t cache_size) {
 	cacheControl = static_cast<control_data*>(vm::allocate_mappable(PAGE_SIZE, cacheControlSize));
 
 	/* Initialize L2 cache */
-	l2CacheEntries = 1024;
+	l2CacheEntries = (cachesize) * 2 ; // Should be two times larger or something in that manner  
 	l2ControlData = argo::cxl_l2::l2_control_init(l2CacheEntries);
 	l2CacheData = argo::cxl_l2::l2Data_init(l2CacheEntries * PAGE_SIZE * CACHELINE);
 	if(!l2CacheData) {
@@ -1415,7 +1478,9 @@ void print_statistics() {
 
 				printf( "\n");
 				printf("#  " CYN "# L2 cache\n" RESET);
-				printf("#  Inserts: %15lu, Total bytes copied: %15lu\n", l2_statistics.inserts.load(), l2_statistics.bytes_l1_to_l2.load());
+				printf("#  Inserts: %15lu, Total bytes copied to L2: %15lu, Hits: %lu\n", l2_statistics.inserts.load(), l2_statistics.bytes_l1_to_l2.load(), l2_statistics.hits.load());
+				printf("#  Evictions: %15lu, Total bytes copied to L1: %15lu, Misses: %lu\n", l2_statistics.evictions.load(), l2_statistics.bytes_l2_to_l1.load(), l2_statistics.misses.load());
+				printf("#  Remote pages inserted: %15lu, Remote pages evicted: %15lu \n", l2_statistics.remote_pages_inserted.load(), l2_statistics.remote_pages_evicted.load());
 				printf("\n");
 				/* Print coherence info */
 				printf("#  " CYN "# Coherence actions\n" RESET);
