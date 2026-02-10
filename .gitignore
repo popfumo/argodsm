@@ -1,3 +1,4 @@
 build/
 docs/_site/
 tests/googletest/
+.vscode/

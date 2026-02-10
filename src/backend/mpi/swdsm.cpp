@@ -323,7 +323,6 @@ void load_cache_entry(std::uintptr_t aligned_access_offset) {
 				// Don't need to load from remote
 				pages_to_load[p] = false;
 				l2_statistics.hits.fetch_add(1);
-				l2_statistics.bytes_l2_to_l1.fetch_add(PAGE_SIZE);
 				if (idx != start_index) {
 					cache_locks[idx].unlock();
 				}
@@ -367,8 +366,9 @@ void load_cache_entry(std::uintptr_t aligned_access_offset) {
 						mpi_lock_data[victim_win_index][victim_homenode].unlock(
 							victim_homenode, data_windows[victim_win_index][victim_homenode]);
 					}
+					argo::cxl_l2::l2_mark_clean(l2ControlData, l2CacheEntries, l2_victim_addr);
 				}
-				l2_statistics.evictions.fetch_add(1); // Should always be more than or equal to remote page evictions
+				l2_statistics.evictions.fetch_add(1); // should always be more than or equal to remote page evictions
 				if(workrank != get_homenode(cacheControl[idx].tag)) 
 				{
 					l2_statistics.remote_pages_evicted.fetch_add(1);
@@ -376,14 +376,12 @@ void load_cache_entry(std::uintptr_t aligned_access_offset) {
 			}
 
 			argo::cxl_l2::l2_insert(l2ControlData, l2CacheEntries, l2CacheData, cacheControl[idx].tag, &cacheData[PAGE_SIZE * idx], (cacheControl[idx].dirty == DIRTY), workrank);
-			l2_statistics.bytes_l1_to_l2.fetch_add(PAGE_SIZE);
+			l2_statistics.bytes_l1_to_l2.fetch_add(PAGE_SIZE * CACHELINE);
 			l2_statistics.inserts.fetch_add(1); // should also be more than or equal to remote page inserts
 			if(workrank != get_homenode(temp_addr)) {
 				l2_statistics.remote_pages_inserted.fetch_add(1);
 			}
 			/* If the page is dirty, write it back */
-			/* Downgrade the page to L2 first */
-			/* Also need to add some extra logic checking if its inside L2 cache */
 			if(cacheControl[idx].dirty == DIRTY) {
 				mprotect(old_ptr, block_size, PROT_READ);
 				for(std::size_t j = 0; j < CACHELINE; j++) {
@@ -998,6 +996,8 @@ void argo_finalize() {
 
 	MPI_Barrier(argo_comm);
 
+	argo::cxl_l2::l2_free(l2CacheData, l2CacheEntries * PAGE_SIZE * CACHELINE);
+	argo::cxl_l2::l2_free(l2ControlData, l2CacheEntries * sizeof(argo::cxl_l2::l2_control_data));
 	// Free data windows
 	for(auto& win_index : data_windows) {
 		for(auto& window : win_index) {
@@ -1065,6 +1065,7 @@ void self_invalidation() {
 				cacheControl[i].dirty = CLEAN;
 				cacheControl[i].state = INVALID;
 				touchedcache[i] = 0;
+				argo::cxl_l2::l2_invalidate(l2ControlData, l2CacheEntries, cacheControl[i].tag);
 				mprotect(static_cast<char*>(startAddr) + lineAddr, PAGE_SIZE*CACHELINE, PROT_NONE);
 			}
 		}
@@ -1165,6 +1166,11 @@ void argo_reset_coherence() {
 		cacheControl[i].tag = GLOBAL_NULL;
 		cacheControl[i].state = INVALID;
 		cacheControl[i].dirty = CLEAN;
+	}
+	for(std::size_t i = 0; i < l2CacheEntries; i++) {
+		l2ControlData[i].state = INVALID;
+		l2ControlData[i].dirty = CLEAN;
+		l2ControlData[i].tag = 0;
 	}
 
 	for(std::size_t i = 0; i < classificationSize; i += (load_size*2)) {

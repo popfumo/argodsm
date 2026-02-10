@@ -109,7 +109,9 @@ typedef struct argo_statistics_struct {
 		double ssd_time;
 		/** @brief Mutex to update ssd_time */
 		std::mutex ssd_time_mutex;
+		/** @brief Number of remote pages loaded inside a node */
 		std::atomic<std::size_t> remote_pages_loaded;
+		/** @brief Number of remote pages evicted inside a node */
 		std::atomic<std::size_t> remote_pages_evicted;
 } argo_statistics;
 

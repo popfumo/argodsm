@@ -910,7 +910,6 @@ TEST_F(backendTest, writeBufferLoad) {
 	argo::codelete_array(array);
 }
 
-
 /**
  * @brief The main function that runs the tests
  * @param argc Number of command line arguments
