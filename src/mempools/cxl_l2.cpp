@@ -7,7 +7,7 @@ namespace argo
     {
         //#define PRINT_L2
 
-        inline std::size_t getL2CacheIndex(std::uintptr_t aligned_addr, std::size_t l2_entries)
+        inline std::size_t get_l2_cache_index(std::uintptr_t aligned_addr, std::size_t l2_entries)
         {
             const std::size_t block_size = PAGE_SIZE * CACHELINE;
             return (aligned_addr / block_size) % l2_entries;
@@ -58,7 +58,7 @@ namespace argo
         {
             assert(l2_controls != nullptr);
 
-            std::size_t idx = getL2CacheIndex(aligned_addr, num_entries);
+            std::size_t idx = get_l2_cache_index(aligned_addr, num_entries);
 
             if (l2_controls[idx].tag == aligned_addr && l2_controls[idx].state == VALID)
             {
@@ -67,7 +67,7 @@ namespace argo
                 printf("Node %d L2 cache HIT for addr %lu at index %zu\n", workrank, aligned_addr, idx);
                 #endif
                 #ifndef PRINT_L2
-                (void)workrank;
+                (void)workrank; // Why
                 #endif
                 return true;
             }
@@ -88,7 +88,7 @@ namespace argo
             assert(page_src != nullptr);
             const std::size_t block_size = PAGE_SIZE * CACHELINE;
 
-            std::size_t idx = getL2CacheIndex(aligned_addr, num_entries);
+            std::size_t idx = get_l2_cache_index(aligned_addr, num_entries);
 
             // If evicting an existing valid entry, count it
             if (l2_controls[idx].state == VALID && l2_controls[idx].tag != aligned_addr)
@@ -146,8 +146,9 @@ namespace argo
                                bool &victim_dirty)
         {
             assert(l2_controls != nullptr);
-
-            std::size_t idx = getL2CacheIndex(aligned_addr, num_entries);
+            assert(aligned_addr != NULL);
+            assert(victim_addr != NULL);
+            std::size_t idx = get_l2_cache_index(aligned_addr, num_entries);
 
             if (l2_controls[idx].state == VALID && l2_controls[idx].tag != aligned_addr)
             {
@@ -161,7 +162,7 @@ namespace argo
         void *l2_get_data_ptr(char *l2_data, std::size_t num_entries, std::uintptr_t aligned_addr)
         {
             const std::size_t block_size = PAGE_SIZE * CACHELINE;
-            std::size_t idx = getL2CacheIndex(aligned_addr, num_entries);
+            std::size_t idx = get_l2_cache_index(aligned_addr, num_entries);
             return l2_data + (idx * block_size);
         }
 
@@ -169,7 +170,7 @@ namespace argo
                            std::uintptr_t aligned_addr)
         {
             assert(l2_controls != nullptr);
-            std::size_t idx = getL2CacheIndex(aligned_addr, num_entries);
+            std::size_t idx = get_l2_cache_index(aligned_addr, num_entries);
 
             if (l2_controls[idx].tag == aligned_addr && l2_controls[idx].state == VALID)
             {
@@ -181,7 +182,7 @@ namespace argo
                          std::uintptr_t aligned_addr)
         {
             assert(l2_controls != nullptr);
-            std::size_t idx = getL2CacheIndex(aligned_addr, num_entries);
+            std::size_t idx = get_l2_cache_index(aligned_addr, num_entries);
 
             return (l2_controls[idx].tag == aligned_addr &&
                     l2_controls[idx].state == VALID &&
@@ -193,7 +194,7 @@ namespace argo
         {
             assert(l2_controls != nullptr);
 
-            std::size_t idx = getL2CacheIndex(aligned_addr, num_entries);
+            std::size_t idx = get_l2_cache_index(aligned_addr, num_entries);
 
             if (l2_controls[idx].tag == aligned_addr && l2_controls[idx].state == VALID)
             {

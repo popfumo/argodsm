@@ -57,7 +57,7 @@ namespace argo
          * @param l2_entries Total number of entries in the L2 cache
          * @return The cache index
          */
-        inline std::size_t getL2CacheIndex(std::uintptr_t aligned_addr, std::size_t l2_entries);
+        inline std::size_t get_l2_cache_index(std::uintptr_t aligned_addr, std::size_t l2_entries);
 
         /**
          * @brief Initialize L2 control data array on CXL memory (NUMA node 2)

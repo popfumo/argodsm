@@ -337,14 +337,15 @@ void load_cache_entry(std::uintptr_t aligned_access_offset) {
 			continue;
 		}
 
-		/* If another page occupies the cache index, begin to evict it. */
-		/* L2 cache implementation point */ 
+		/* If another page occupies the cache index, begin to evict it from L1. */ 
 		/* If another page has the cache index, downgrade it to L2 instead*/
 		if((cacheControl[idx].tag != temp_addr) && (cacheControl[idx].tag != GLOBAL_NULL)) {
 			void* old_ptr = static_cast<char*>(startAddr) + cacheControl[idx].tag;
 			void* temp_ptr = static_cast<char*>(startAddr) + temp_addr;
 			std::uintptr_t l2_victim_addr;
 			bool l2_victim_dirty;
+			
+			// Check if L2 needs eviction 
 			if (argo::cxl_l2::l2_needs_eviction(l2ControlData, l2CacheEntries,
 					cacheControl[idx].tag, l2_victim_addr, l2_victim_dirty))
 			{
@@ -368,25 +369,25 @@ void load_cache_entry(std::uintptr_t aligned_access_offset) {
 					}
 					argo::cxl_l2::l2_mark_clean(l2ControlData, l2CacheEntries, l2_victim_addr);
 				}
-				l2_statistics.evictions.fetch_add(1); // should always be more than or equal to remote page evictions
-				if(workrank != get_homenode(cacheControl[idx].tag)) 
+				l2_statistics.evictions.fetch_add(1);
+				if(workrank != get_homenode(l2_victim_addr)) 
 				{
 					l2_statistics.remote_pages_evicted.fetch_add(1);
 				}
 			}
 
-			argo::cxl_l2::l2_insert(l2ControlData, l2CacheEntries, l2CacheData, cacheControl[idx].tag, &cacheData[PAGE_SIZE * idx], (cacheControl[idx].dirty == DIRTY), workrank);
+			// Insert L1 victim into L2 
+			argo::cxl_l2::l2_insert(l2ControlData, l2CacheEntries, l2CacheData, 
+				cacheControl[idx].tag, &cacheData[PAGE_SIZE * idx], 
+				(cacheControl[idx].dirty == DIRTY), workrank);
 			l2_statistics.bytes_l1_to_l2.fetch_add(PAGE_SIZE * CACHELINE);
-			l2_statistics.inserts.fetch_add(1); // should also be more than or equal to remote page inserts
-			if(workrank != get_homenode(temp_addr)) {
+			l2_statistics.inserts.fetch_add(1);
+			if(workrank != get_homenode(cacheControl[idx].tag)) {
 				l2_statistics.remote_pages_inserted.fetch_add(1);
 			}
-			/* If the page is dirty, write it back */
+
+			// Remove the write buffer entry if page was dirty 
 			if(cacheControl[idx].dirty == DIRTY) {
-				mprotect(old_ptr, block_size, PROT_READ);
-				for(std::size_t j = 0; j < CACHELINE; j++) {
-					storepageDIFF(idx+j, PAGE_SIZE*j+(cacheControl[idx].tag));
-				}
 				argo_write_buffer->erase(idx);
 			}
 
