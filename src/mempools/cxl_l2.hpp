@@ -16,18 +16,15 @@
 class l2_stats
 {
 public:
-    std::atomic<std::size_t> hits{0};
-    std::atomic<std::size_t> misses{0};
     std::atomic<std::size_t> inserts{0};
     std::atomic<std::size_t> evictions{0};
     std::atomic<std::size_t> bytes_l1_to_l2{0};
     std::atomic<std::size_t> bytes_l2_to_l1{0};
     std::atomic<std::size_t> remote_pages_inserted{0};
     std::atomic<std::size_t> remote_pages_evicted{0};
+    
     void l2_reset_stats()
     {
-        hits.store(0, std::memory_order_relaxed);
-        misses.store(0, std::memory_order_relaxed);
         inserts.store(0, std::memory_order_relaxed);
         evictions.store(0, std::memory_order_relaxed);
         bytes_l1_to_l2.store(0, std::memory_order_relaxed);
@@ -49,6 +46,7 @@ namespace argo
             argo_byte dirty;
             /** @brief Tag of the cache line - stores the aligned global address */
             std::uintptr_t tag;
+            std::mutex lock; 
         };
 
         /**

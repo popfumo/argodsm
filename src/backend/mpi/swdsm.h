@@ -113,6 +113,14 @@ typedef struct argo_statistics_struct {
 		std::atomic<std::size_t> remote_pages_loaded;
 		/** @brief Number of remote pages evicted inside a node */
 		std::atomic<std::size_t> remote_pages_evicted;
+        /** @brief Total cache accesses (every load_cache_entry call) */
+        std::atomic<std::size_t> cache_accesses;
+        /** @brief L1 cache hits */
+        std::atomic<std::size_t> l1_hits;
+        /** @brief L2 cache hits */
+        std::atomic<std::size_t> l2_hits;
+        /** @brief Cache misses (need to fetch from remote) */
+        std::atomic<std::size_t> cache_misses;
 } argo_statistics;
 
 /**

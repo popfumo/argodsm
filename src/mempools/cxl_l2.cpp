@@ -54,12 +54,13 @@ namespace argo
         }
 
         bool l2_lookup(l2_control_data *l2_controls, std::size_t num_entries,
-                       std::uintptr_t aligned_addr, std::size_t &index_out, int workrank)
+                    std::uintptr_t aligned_addr, std::size_t &index_out, int workrank)
         {
             assert(l2_controls != nullptr);
-
             std::size_t idx = get_l2_cache_index(aligned_addr, num_entries);
-
+            
+            std::lock_guard<std::mutex> lock(l2_controls[idx].lock); 
+            
             if (l2_controls[idx].tag == aligned_addr && l2_controls[idx].state == VALID)
             {
                 index_out = idx;
@@ -67,45 +68,47 @@ namespace argo
                 printf("Node %d L2 cache HIT for addr %lu at index %zu\n", workrank, aligned_addr, idx);
                 #endif
                 #ifndef PRINT_L2
-                (void)workrank; // Why
+                (void)workrank;
                 #endif
                 return true;
             }
-
+            
             #ifdef PRINT_L2
             printf("Node %d L2 cache MISS for addr %lu at index %zu (tag=%lu, state=%d)\n", workrank,
-                   aligned_addr, idx, l2_controls[idx].tag, l2_controls[idx].state);
+                aligned_addr, idx, l2_controls[idx].tag, l2_controls[idx].state);
             #endif
             return false;
         }
 
         void l2_insert(l2_control_data *l2_controls, std::size_t num_entries,
-                       char *l2_data, std::uintptr_t aligned_addr,
-                       void *page_src, bool is_dirty, int workrank)
+                    char *l2_data, std::uintptr_t aligned_addr,
+                    void *page_src, bool is_dirty, int workrank)
         {
             assert(l2_controls != nullptr);
             assert(l2_data != nullptr);
             assert(page_src != nullptr);
             const std::size_t block_size = PAGE_SIZE * CACHELINE;
-
+            
             std::size_t idx = get_l2_cache_index(aligned_addr, num_entries);
-
+            
+            std::lock_guard<std::mutex> lock(l2_controls[idx].lock);  
+            
             // If evicting an existing valid entry, count it
             if (l2_controls[idx].state == VALID && l2_controls[idx].tag != aligned_addr)
             {
                 #ifdef PRINT_L2
                 printf("Node %d L2 evicting addr %lu from index %zu to make room for %lu\n", workrank,
-                       l2_controls[idx].tag, idx, aligned_addr);
+                    l2_controls[idx].tag, idx, aligned_addr);
                 #endif
                 #ifndef PRINT_L2
                 (void)workrank;
                 #endif
             }
-
+            
             // Copy the cache block (CACHELINE pages) to L2
             void *dest = l2_data + (idx * block_size);
             memcpy(dest, page_src, block_size);
-
+            
             // Update control data
             l2_controls[idx].tag = aligned_addr;
             l2_controls[idx].state = VALID;
@@ -122,7 +125,7 @@ namespace argo
             assert(l2_data != nullptr);
             assert(page_dest != nullptr);
             const std::size_t block_size = PAGE_SIZE * CACHELINE;
-
+            
             std::size_t idx;
             if (!l2_lookup(l2_controls, num_entries, aligned_addr, idx, workrank))
             {
@@ -131,12 +134,23 @@ namespace argo
                 #endif
                 return false;
             }
-
+            
+            // l2_lookup already locked and unlocked, we need to re-lock for extraction
+            std::lock_guard<std::mutex> lock(l2_controls[idx].lock);  
+            
+            // Verify it's still valid (could have been evicted between lookup and lock)
+            if (l2_controls[idx].tag != aligned_addr || l2_controls[idx].state != VALID)
+            {
+                return false;
+            }
+            
             // Copy the cache block from L2 to destination
             void *src = l2_data + (idx * block_size);
             memcpy(page_dest, src, block_size);
+            l2_controls[idx].state = INVALID;
+            
             #ifdef PRINT_L2
-            printf("L2 extracted addr %lu from index %zu to dest %p\n", aligned_addr, idx, page_dest);
+            printf("L2 extracted addr %lu from index %zu to dest %p (now invalidated)\n", aligned_addr, idx, page_dest);
             #endif 
             return true;
         }
@@ -147,7 +161,6 @@ namespace argo
         {
             assert(l2_controls != nullptr);
             assert(aligned_addr != NULL);
-            assert(victim_addr != NULL);
             std::size_t idx = get_l2_cache_index(aligned_addr, num_entries);
 
             if (l2_controls[idx].state == VALID && l2_controls[idx].tag != aligned_addr)
