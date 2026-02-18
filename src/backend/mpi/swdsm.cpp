@@ -8,7 +8,8 @@
 #include <cstddef>
 #include <memory>
 #include <vector>
-
+#include <numa.h>
+#include <numaif.h>
 #include "backend/mpi/swdsm.h"
 #include "config.hpp"
 #include "data_distribution/global_ptr.hpp"
@@ -294,7 +295,9 @@ void load_cache_entry(std::uintptr_t aligned_access_offset) {
 		if((cacheControl[idx].tag != temp_addr) && (cacheControl[idx].tag != GLOBAL_NULL)) {
 			void* old_ptr = static_cast<char*>(startAddr) + cacheControl[idx].tag;
 			void* temp_ptr = static_cast<char*>(startAddr) + temp_addr;
-
+			int numa_node_number = -1;
+			get_mempolicy(&numa_node_number, nullptr, 0, old_ptr, MPOL_F_NODE | MPOL_F_ADDR);
+			//printf("Evicting page from NUMA node %d\n", numa_node_number);
 			/* If the page is dirty, write it back */
 			if(cacheControl[idx].dirty == DIRTY) {
 				mprotect(old_ptr, block_size, PROT_READ);
@@ -735,106 +738,128 @@ std::size_t align_forwards(std::size_t offset, std::size_t size) {
 }
 
 void argo_initialize(std::size_t argo_size, std::size_t cache_size) {
-	initmpi();
-	double init_start = MPI_Wtime();
+    initmpi();
+    double init_start = MPI_Wtime();
 
-	/** Standardise the ArgoDSM memory space */
-	argo_size = std::max(argo_size, static_cast<std::size_t>(PAGE_SIZE*numtasks));
-	argo_size = align_forwards(argo_size, PAGE_SIZE*CACHELINE*numtasks*dd::policy_padding());
+    /** Standardise the ArgoDSM memory space */
+    argo_size = std::max(argo_size, static_cast<std::size_t>(PAGE_SIZE*numtasks));
+    argo_size = align_forwards(argo_size, PAGE_SIZE*CACHELINE*numtasks*dd::policy_padding());
 
-	startAddr = vm::start_address();
+    startAddr = vm::start_address();
 #ifdef ARGO_PRINT_STATISTICS
-	printf("maximum virtual memory: %ld GiB\n", vm::size() >> 30);
+    printf("maximum virtual memory: %ld GiB\n", vm::size() >> 30);
 #endif
 
-	threadbarrier = static_cast<pthread_barrier_t *>(malloc(sizeof(pthread_barrier_t)*(NUM_THREADS+1)));
-	for(std::size_t i = 1; i <= NUM_THREADS; i++) {
-		pthread_barrier_init(&threadbarrier[i], NULL, i);
-	}
+    threadbarrier = static_cast<pthread_barrier_t *>(malloc(sizeof(pthread_barrier_t)*(NUM_THREADS+1)));
+    for(std::size_t i = 1; i <= NUM_THREADS; i++) {
+        pthread_barrier_init(&threadbarrier[i], NULL, i);
+    }
 
-	/** Get the number of pages to load from the env module */
-	load_size = env::load_size();
-	/** Limit cache_size to at most argo_size */
-	cachesize = std::min(argo_size, cache_size);
-	/** Round the number of cache pages upwards */
-	cachesize = align_forwards(cachesize, PAGE_SIZE*CACHELINE);
-	/** At least two pages are required to prevent endless eviction loops */
-	cachesize = std::max(cachesize, static_cast<std::size_t>(PAGE_SIZE*CACHELINE*2));
-	cachesize /= PAGE_SIZE;
+    /** Get the number of pages to load from the env module */
+    load_size = env::load_size();
+    
+    /** Limit cache_size to at most argo_size */
+    cachesize = std::min(argo_size, cache_size);
+    /** Round the number of cache pages upwards */
+    cachesize = align_forwards(cachesize, PAGE_SIZE*CACHELINE);
+    /** At least two pages are required to prevent endless eviction loops */
+    cachesize = std::max(cachesize, static_cast<std::size_t>(PAGE_SIZE*CACHELINE*2));
+    cachesize /= PAGE_SIZE;
+    
+
+    std::size_t l1_cache_pages = cachesize;  
+    std::size_t l2_cache_pages = cachesize * 2;  
+	cachesize = l1_cache_pages + l2_cache_pages;  
 	cache_locks.resize(cachesize);
 
-	classificationSize = 2*(argo_size/PAGE_SIZE);
-	argo_write_buffer = new write_buffer<std::size_t>();
 
-	// Allocate local memory for each node
-	size_of_all = argo_size;      // total distr. global memory
-	GLOBAL_NULL = size_of_all+1;
-	size_of_chunk = argo_size/(numtasks);  // part on each node
-	sig::signal_handler<SIGSEGV>::install_argo_handler(&handler);
+    classificationSize = 2*(argo_size/PAGE_SIZE);
+    argo_write_buffer = new write_buffer<std::size_t>();
 
-	std::size_t cacheControlSize = sizeof(control_data)*cachesize;
-	std::size_t gwritersize = classificationSize*sizeof(std::uint64_t);
-	cacheControlSize = align_forwards(cacheControlSize, PAGE_SIZE);
-	gwritersize = align_forwards(gwritersize, PAGE_SIZE);
+    // Allocate local memory for each node
+    size_of_all = argo_size;
+    GLOBAL_NULL = size_of_all+1;
+    size_of_chunk = argo_size/(numtasks);
+    sig::signal_handler<SIGSEGV>::install_argo_handler(&handler);
 
-	owners_dir_size = 3*(argo_size/PAGE_SIZE);
-	std::size_t owners_dir_size_bytes = owners_dir_size*sizeof(std::size_t);
-	owners_dir_size_bytes = align_forwards(owners_dir_size_bytes, PAGE_SIZE);
+    std::size_t cacheControlSize = sizeof(control_data)*cachesize;
+    std::size_t gwritersize = classificationSize*sizeof(std::uint64_t);
+    cacheControlSize = align_forwards(cacheControlSize, PAGE_SIZE);
+    gwritersize = align_forwards(gwritersize, PAGE_SIZE);
 
-	std::size_t offsets_tbl_size = numtasks;
-	std::size_t offsets_tbl_size_bytes = offsets_tbl_size*sizeof(std::size_t);
-	offsets_tbl_size_bytes = align_forwards(offsets_tbl_size_bytes, PAGE_SIZE);
+    owners_dir_size = 3*(argo_size/PAGE_SIZE);
+    std::size_t owners_dir_size_bytes = owners_dir_size*sizeof(std::size_t);
+    owners_dir_size_bytes = align_forwards(owners_dir_size_bytes, PAGE_SIZE);
 
-	cacheoffset = PAGE_SIZE*cachesize+cacheControlSize;
+    std::size_t offsets_tbl_size = numtasks;
+    std::size_t offsets_tbl_size_bytes = offsets_tbl_size*sizeof(std::size_t);
+    offsets_tbl_size_bytes = align_forwards(offsets_tbl_size_bytes, PAGE_SIZE);
 
-	globalData = static_cast<char*>(vm::allocate_mappable(PAGE_SIZE, size_of_chunk));
-	cacheData = static_cast<char*>(vm::allocate_mappable(PAGE_SIZE, cachesize*PAGE_SIZE));
-	cacheControl = static_cast<control_data*>(vm::allocate_mappable(PAGE_SIZE, cacheControlSize));
+    cacheoffset = PAGE_SIZE*cachesize+cacheControlSize;
 
-	touchedcache = static_cast<argo_byte*>(malloc(cachesize));
-	if(touchedcache == NULL) {
-		printf("malloc error out of memory\n");
-		exit(EXIT_FAILURE);
-	}
+    globalData = static_cast<char*>(vm::allocate_mappable(PAGE_SIZE, size_of_chunk));
+    
+    cacheData = static_cast<char*>(vm::allocate_mappable(PAGE_SIZE, cachesize*PAGE_SIZE));
+    
+    cacheControl = static_cast<control_data*>(vm::allocate_mappable(PAGE_SIZE, cacheControlSize));
 
-	pagecopy = static_cast<char*>(vm::allocate_mappable(PAGE_SIZE, cachesize*PAGE_SIZE));
-	globalSharers = static_cast<std::uint64_t*>(vm::allocate_mappable(PAGE_SIZE, gwritersize));
+    touchedcache = static_cast<argo_byte*>(malloc(cachesize));
+    if(touchedcache == NULL) {
+        printf("malloc error out of memory\n");
+        exit(EXIT_FAILURE);
+    }
 
-	if (dd::is_first_touch_policy()) {
-		global_owners_dir = static_cast<std::uintptr_t*>(vm::allocate_mappable(PAGE_SIZE, owners_dir_size_bytes));
-		global_offsets_tbl = static_cast<std::uintptr_t*>(vm::allocate_mappable(PAGE_SIZE, offsets_tbl_size_bytes));
-	}
+    pagecopy = static_cast<char*>(vm::allocate_mappable(PAGE_SIZE, cachesize*PAGE_SIZE));
+    globalSharers = static_cast<std::uint64_t*>(vm::allocate_mappable(PAGE_SIZE, gwritersize));
 
-	char processor_name[MPI_MAX_PROCESSOR_NAME];
-	int name_len;
-	MPI_Get_processor_name(processor_name, &name_len);
+    if (dd::is_first_touch_policy()) {
+        global_owners_dir = static_cast<std::uintptr_t*>(vm::allocate_mappable(PAGE_SIZE, owners_dir_size_bytes));
+        global_offsets_tbl = static_cast<std::uintptr_t*>(vm::allocate_mappable(PAGE_SIZE, offsets_tbl_size_bytes));
+    }
 
-	MPI_Barrier(argo_comm);
+    char processor_name[MPI_MAX_PROCESSOR_NAME];
+    int name_len;
+    MPI_Get_processor_name(processor_name, &name_len);
 
-	void* tmpcache;
-	tmpcache = cacheData;
-	vm::map_memory(tmpcache, PAGE_SIZE*cachesize, 0, PROT_READ|PROT_WRITE);
+    MPI_Barrier(argo_comm);
 
-	std::size_t current_offset = PAGE_SIZE*cachesize;
-	tmpcache = cacheControl;
-	vm::map_memory(tmpcache, cacheControlSize, current_offset, PROT_READ|PROT_WRITE);
+    void* tmpcache;
+    tmpcache = cacheData;
+    
+    // Map the entire cache space first
+    vm::map_memory(tmpcache, PAGE_SIZE*cachesize, 0, PROT_READ|PROT_WRITE);
 
-	current_offset += cacheControlSize;
-	tmpcache = globalData;
-	vm::map_memory(tmpcache, size_of_chunk, current_offset, PROT_READ|PROT_WRITE);
+    // Bind different regions to different NUMA nodes
+    int local_node = numa_node_of_cpu(sched_getcpu());
+    numa_tonode_memory(cacheData, l1_cache_pages * PAGE_SIZE, local_node);
+    
+    numa_tonode_memory(cacheData + (l1_cache_pages * PAGE_SIZE), 
+                       l2_cache_pages * PAGE_SIZE, 
+                       2); 
+    
+    printf("Node %d: Cache initialized - L1: %zu pages (DRAM node %d), L2: %zu pages (CXL node 2)\n",
+           workrank, l1_cache_pages, local_node, l2_cache_pages);
 
-	current_offset += size_of_chunk;
-	tmpcache = globalSharers;
-	vm::map_memory(tmpcache, gwritersize, current_offset, PROT_READ|PROT_WRITE);
+    std::size_t current_offset = PAGE_SIZE*cachesize;
+    tmpcache = cacheControl;
+    vm::map_memory(tmpcache, cacheControlSize, current_offset, PROT_READ|PROT_WRITE);
 
-	if (dd::is_first_touch_policy()) {
-		current_offset += gwritersize;
-		tmpcache = global_owners_dir;
-		vm::map_memory(tmpcache, owners_dir_size_bytes, current_offset, PROT_READ|PROT_WRITE);
-		current_offset += owners_dir_size_bytes;
-		tmpcache = global_offsets_tbl;
-		vm::map_memory(tmpcache, offsets_tbl_size_bytes, current_offset, PROT_READ|PROT_WRITE);
-	}
+    current_offset += cacheControlSize;
+    tmpcache = globalData;
+    vm::map_memory(tmpcache, size_of_chunk, current_offset, PROT_READ|PROT_WRITE);
+
+    current_offset += size_of_chunk;
+    tmpcache = globalSharers;
+    vm::map_memory(tmpcache, gwritersize, current_offset, PROT_READ|PROT_WRITE);
+
+    if (dd::is_first_touch_policy()) {
+        current_offset += gwritersize;
+        tmpcache = global_owners_dir;
+        vm::map_memory(tmpcache, owners_dir_size_bytes, current_offset, PROT_READ|PROT_WRITE);
+        current_offset += owners_dir_size_bytes;
+        tmpcache = global_offsets_tbl;
+        vm::map_memory(tmpcache, offsets_tbl_size_bytes, current_offset, PROT_READ|PROT_WRITE);
+    }
 
 	// Get the number of MPI windows requested and adjust for number of nodes
 	// On a single node, the number of windows defaults to 1 for performance reasons
