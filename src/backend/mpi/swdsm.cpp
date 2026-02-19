@@ -8,7 +8,7 @@
 #include <cstddef>
 #include <memory>
 #include <vector>
-
+#include <numa.h>
 #include "backend/mpi/swdsm.h"
 #include "config.hpp"
 #include "data_distribution/global_ptr.hpp"
@@ -20,6 +20,8 @@ namespace dd = argo::data_distribution;
 namespace vm = argo::virtual_memory;
 namespace sig = argo::signal;
 namespace env = argo::env;
+
+#define ENABLE_L2
 
 /*Barrier*/
 /** @brief  Locks access to part that does SD in the global barrier */
@@ -38,7 +40,7 @@ std::size_t cacheoffset;
 /** @brief  Keeps state, tag and dirty bit of the cache*/
 control_data * cacheControl;
 /** @brief  keeps track of readers and writers*/
-std::uint64_t *globalSharers;
+std::uint64_t *globalSharers; 
 /** @brief  size of pyxis directory*/
 std::size_t classificationSize;
 /** @brief  Tracks if a page is touched this epoch*/
@@ -49,6 +51,16 @@ char* cacheData;
 char * pagecopy;
 /** @brief Pointer to locks protecting the page cache */
 std::vector<cache_lock> cache_locks;
+#ifdef ENABLE_L2
+/** @brief  Keeps state, tag and dirty bit of the l2 victim cache*/
+control_data * l2CacheControl;
+/** @brief  The local l2 page cache*/
+char* l2CacheData;
+/** @brief Pointer to locks protecting the l2 page cache */
+std::vector<cache_lock> l2_cache_locks;
+/** @brief Copy of the l2 cache to keep twinpages for later being able to DIFF stores */
+char * l2pagecopy;
+#endif
 /** @brief Mutex ensuring that only one thread can perform node-wide synchronization */
 std::shared_mutex sync_lock;
 
@@ -282,9 +294,32 @@ void load_cache_entry(std::uintptr_t aligned_access_offset) {
 				pages_to_load[p] = false;
 				cache_locks[idx].unlock();
 				continue;
-			} else {
+			}
+			// We shouldn't copy stuff back here, there might still be valid data in the l1 cache. 
+			// This big loop just checks if a page is present in the cache, eviction and fetching is handled down below
+			// But we need to somehow distinguish between a page is present in l1 or l2. Maybe that doesn't really matter, we just copy from l2 to l1 if its present there.
+			#ifdef ENABLE_L2
+			if(l2_cache_locks[idx].try_lock()) {
+				// if no hit inside regular data cache, check if the page is present in the l2. 
+				if(l2CacheControl[idx].tag == temp_addr && l2CacheControl[idx].state != INVALID) {
+					pages_to_load[p] = false;
+					l2_cache_locks[idx].unlock();
+					cache_locks[idx].unlock();
+					continue;
+				}
+				pages_to_load[p] = true;
+				l2_cache_locks[idx].unlock();
+			}
+			
+			else {
 				pages_to_load[p] = true;
 			}
+			#else 
+			// hmmm
+			else {
+				pages_to_load[p] = true;
+			}
+			#endif
 		} else {
 			pages_to_load[p] = false;
 			continue;
@@ -292,23 +327,114 @@ void load_cache_entry(std::uintptr_t aligned_access_offset) {
 
 		/* If another page occupies the cache index, begin to evict it. */
 		if((cacheControl[idx].tag != temp_addr) && (cacheControl[idx].tag != GLOBAL_NULL)) {
+			// old_ptr i
 			void* old_ptr = static_cast<char*>(startAddr) + cacheControl[idx].tag;
 			void* temp_ptr = static_cast<char*>(startAddr) + temp_addr;
 
 			/* If the page is dirty, write it back */
+			// For the l2, it doesn't matter if the page is dirty when its evicted from l1. But we need to do the same thing as we are doing now when we are evicting from l2 to make sure that we don't lose any updates. So we need to check if the page is dirty in l2 when we are evicting from l1, and if it is, we need to write it back to the l2 cache instead of writing it back to the remote node.
+			// Next question is how do we guarantee that the writeback from l2 to remote is actually done? What if the page is never evicted from the cache at all?
+			// We also need to rethink what type of cache l2 should be. Right now its direct mapped, meaning that each page in l1 can only be stored in one specific location in l2 => l2 must be the same size as l1. Start simple and do that, then we can make it fully associative later... 
+
+			#ifdef ENABLE_L2
+			// Begin the process of moving L1 victim to L2. Start by locking the L2. 
+			if(l2_cache_locks[idx].try_lock()) {
+				bool l1_dirty = (cacheControl[idx].dirty == DIRTY);
+				bool l2_dirty = (l2CacheControl[idx].dirty == DIRTY);
+				// This means that we can only have one page in l2 for each page in l1, but it also means that we can easily find the page in l2 when we are evicting from l1.
+				// So when we are evicting from l1, we check if the page is dirty in l1, if it is, we write it back to l2. If the page is dirty in l2, we write it back to remote. 
+				// Then we can safely evict the page from l1 and insert the new page into l1.
+				
+				if(l1_dirty) {
+					// Copy dirty page from L1 to L2, destionation is beginning of l2 array plus the idx with the pagesize offset. source is the same but in the l1 array.
+					// Not trivial, we also need to check if l2 needs evicition. If the page in l2 is dirty, we need to write it back to remote before we can overwrite it with the page from l1.
+					if((l2CacheControl[idx].tag != temp_addr && l2CacheControl[idx].tag != GLOBAL_NULL) && l2CacheControl[idx].state != INVALID)
+					{
+						// Valid page in l2 that is not the same as the one we want to insert, evict
+						if(l2_dirty) {
+							// If l2 is dirty, write it back to remote before overwriting it.
+							void* old_ptr = static_cast<char*>(startAddr) + l2CacheControl[idx].tag;
+							mprotect(old_ptr, block_size, PROT_READ);
+							for(std::size_t j = 0; j < CACHELINE; j++) {
+								storepageDIFF(idx+j, PAGE_SIZE*j+(l2CacheControl[idx].tag));
+							}
+							argo_write_buffer->erase(idx);
+							l2CacheControl[idx].dirty = DIRTY;
+							l2CacheControl[idx].tag = temp_addr;
+						}
+						// else, there is a clean page in l2 that can be overwritten without writeback. Since we are inside l1 dirty condition, we must set l2 cachecontrol to dirty
+						else {
+							l2CacheControl[idx].dirty = DIRTY;
+							l2CacheControl[idx].tag = temp_addr;
+
+						}
+						// Copy the page from l1 to l2
+						memcpy(l2CacheData + idx*PAGE_SIZE, cacheData + idx*PAGE_SIZE, PAGE_SIZE);
+						l2_cache_locks[idx].unlock();
+					}
+					else
+					{
+						// No valid page in l2, just copy the page from l1 to l2 and mark it as dirty with the correct tag. 
+						memcpy(l2CacheData + idx*PAGE_SIZE, cacheData + idx*PAGE_SIZE, PAGE_SIZE);
+						l2CacheControl[idx].dirty = DIRTY;
+						l2CacheControl[idx].tag = temp_addr;
+						l2_cache_locks[idx].unlock();
+					}
+				
+				}
+				else {
+
+					// Same logic here, check if there is a valid page in l2 that is not the same as the one want to insert
+					// if there is a valid page in l2, we need to evict it before we can move the page from l1 to l2. 
+					if((l2CacheControl[idx].tag != temp_addr && l2CacheControl[idx].tag != GLOBAL_NULL) && l2CacheControl[idx].state != INVALID)
+					{
+						// Valid page in l2 that is not the same as the one we want to insert, evict
+						if(l2_dirty) {
+							// If l2 is dirty, write it back to remote before overwriting it.
+							void* old_ptr = static_cast<char*>(startAddr) + l2CacheControl[idx].tag;
+							mprotect(old_ptr, block_size, PROT_READ);
+							for(std::size_t j = 0; j < CACHELINE; j++) {
+								storepageDIFF(idx+j, PAGE_SIZE*j+(l2CacheControl[idx].tag));
+							}
+							argo_write_buffer->erase(idx);
+						}
+						// else, there is a clean page in l2 that can be overwritten without writeback. Since we are inside l1 clean condition, we can also mark the page in l2 as clean
+						l2CacheControl[idx].dirty = CLEAN;
+						l2CacheControl[idx].tag = temp_addr;
+						l2CacheControl[idx].state = VALID;
+						// Copy the page from l1 to l2
+						memcpy(l2CacheData + idx*PAGE_SIZE, cacheData + idx*PAGE_SIZE, PAGE_SIZE);
+						l2_cache_locks[idx].unlock();
+					}
+					else
+					{
+						// No valid page in l2, just copy the page from l1 to l2 and mark it as clean with the correct tag. 
+						memcpy(l2CacheData + idx*PAGE_SIZE, cacheData + idx*PAGE_SIZE, PAGE_SIZE);
+						l2CacheControl[idx].dirty = CLEAN;
+						l2CacheControl[idx].tag = temp_addr;
+						l2CacheControl[idx].state = VALID;
+						l2_cache_locks[idx].unlock();
+					}
+
+				}
+			}
+			#else			
 			if(cacheControl[idx].dirty == DIRTY) {
+				// mprotect the page to read so we can write it back to the remote node. 
 				mprotect(old_ptr, block_size, PROT_READ);
 				for(std::size_t j = 0; j < CACHELINE; j++) {
 					storepageDIFF(idx+j, PAGE_SIZE*j+(cacheControl[idx].tag));
 				}
 				argo_write_buffer->erase(idx);
 			}
+			#endif
 
 			/* Clean up cache and protect memory */
 			cacheControl[idx].state = INVALID;
 			cacheControl[idx].tag = temp_addr;
 			cacheControl[idx].dirty = CLEAN;
 			vm::map_memory(temp_ptr, block_size, PAGE_SIZE*idx, PROT_NONE);
+			
 			mprotect(old_ptr, block_size, PROT_NONE);
 		}
 	}
@@ -418,11 +544,11 @@ void load_cache_entry(std::uintptr_t aligned_access_offset) {
 	/* Update the cache */
 	for(std::size_t idx = start_index, p = 0; idx < end_index; idx+=CACHELINE, p+=CACHELINE) {
 		/* Update only the pages necessary */
+		const std::size_t temp_addr = aligned_access_offset + p*block_size;
 		if(pages_to_load[p]) {
 			/* Insert the data in the node cache */
 			memcpy(&cacheData[idx*block_size], &temp_data[p*block_size], block_size);
 
-			const std::size_t temp_addr = aligned_access_offset + p*block_size;
 			void* temp_ptr = static_cast<char*>(startAddr) + temp_addr;
 
 			/* If this is the first time inserting in to this index, perform vm map */
@@ -441,6 +567,31 @@ void load_cache_entry(std::uintptr_t aligned_access_offset) {
 				cache_locks[idx].unlock();
 			}
 		}
+		// Here we could probably do the copy from l2 to l1. I thought earlier that we need to distinguish between l1 and l2 placement. But maybe we can just do the copy here for all pages that are present in l2, and then we know for sure that the data is in l1 when we get here. 
+		// We need to secure (lock) both l1 and l2 cache when doing this copy in order to make sure that we avoid race conditions
+		// Secure l1 first and then l2
+		else if(l2CacheControl[idx].tag == temp_addr && l2CacheControl[idx].state != INVALID) {
+			l2_cache_locks[idx].lock();
+			memcpy(&cacheData[idx*block_size], &l2CacheData[idx*block_size], block_size);
+			void* temp_ptr = static_cast<char*>(startAddr) + temp_addr;
+			if(cacheControl[idx].tag == GLOBAL_NULL) {
+				vm::map_memory(temp_ptr, block_size, PAGE_SIZE*idx, PROT_READ);
+				cacheControl[idx].tag = temp_addr;
+			} else {
+				/* Else, just mprotect the region */
+				mprotect(temp_ptr, block_size, PROT_READ);
+			}
+			l2_cache_locks[idx].unlock();
+			cacheControl[idx].state = VALID;
+			cacheControl[idx].dirty = l2CacheControl[idx].dirty; 
+			touchedcache[idx] = 1;
+
+			cache_locks[idx].unlock();
+		}
+		else {
+			cache_locks[idx].unlock();
+		}
+
 	}
 }
 
@@ -688,21 +839,34 @@ void handler(int sig, siginfo_t *si, void *context) {
 	return;
 }
 
-void initmpi() {
-	int ret, initialized, thread_status;
-	int thread_level = MPI_THREAD_MULTIPLE;
-	MPI_Initialized(&initialized);
-	if (!initialized) {
-		ret = MPI_Init_thread(NULL, NULL, thread_level, &thread_status);
-	} else {
-		printf("MPI was already initialized before starting ArgoDSM - shutting down\n");
-		exit(EXIT_FAILURE);
-	}
+namespace {
+// Track whether Argo called MPI_Init so we know if we should MPI_Finalize
+bool argo_called_mpi_init = false;
+}
 
-	if (ret != MPI_SUCCESS || thread_status != thread_level) {
-		printf("MPI not able to start properly\n");
-		MPI_Abort(MPI_COMM_WORLD, ret);
-		exit(EXIT_FAILURE);
+void initmpi() {
+	int initialized = 0;
+	MPI_Initialized(&initialized);
+
+	int thread_status = 0;
+	const int thread_level = MPI_THREAD_MULTIPLE;
+
+	if (!initialized) {
+		int ret = MPI_Init_thread(NULL, NULL, thread_level, &thread_status);
+		if (ret != MPI_SUCCESS || thread_status != thread_level) {
+			printf("MPI not able to start properly\n");
+			MPI_Abort(MPI_COMM_WORLD, ret);
+			exit(EXIT_FAILURE);
+		}
+		argo_called_mpi_init = true;
+	} else {
+		// MPI already initialized by the application/test harness. Proceed.
+		MPI_Query_thread(&thread_status);
+		// If thread support is lower than requested, continue but warn.
+		if (thread_status < thread_level) {
+			fprintf(stderr, "[ArgoDSM] Warning: MPI thread support lower than required (have %d, need %d).\n", thread_status, thread_level);
+		}
+		argo_called_mpi_init = false;
 	}
 
 	MPI_Comm_dup(MPI_COMM_WORLD, &argo_comm);
@@ -766,6 +930,7 @@ void argo_initialize(std::size_t argo_size, std::size_t cache_size) {
 	classificationSize = 2*(argo_size/PAGE_SIZE);
 	argo_write_buffer = new write_buffer<std::size_t>();
 
+
 	// Allocate local memory for each node
 	size_of_all = argo_size;      // total distr. global memory
 	GLOBAL_NULL = size_of_all+1;
@@ -786,6 +951,18 @@ void argo_initialize(std::size_t argo_size, std::size_t cache_size) {
 	offsets_tbl_size_bytes = align_forwards(offsets_tbl_size_bytes, PAGE_SIZE);
 
 	cacheoffset = PAGE_SIZE*cachesize+cacheControlSize;
+
+	#ifdef ENABLE_L2
+	
+	std::size_t l2_cache_entries = cachesize;
+	std::size_t l2CacheControlSize = sizeof(control_data) * l2_cache_entries;
+	l2CacheControlSize = align_forwards(l2CacheControlSize, PAGE_SIZE);
+	l2_cache_locks.resize(l2_cache_entries);
+
+	l2CacheData = static_cast<char*>(numa_alloc_onnode(l2_cache_entries * PAGE_SIZE, 2));
+	l2CacheControl = static_cast<control_data*>(numa_alloc_onnode(l2CacheControlSize, 2));
+	l2pagecopy = static_cast<char*>(numa_alloc_onnode(l2_cache_entries * PAGE_SIZE, 2));
+	#endif
 
 	globalData = static_cast<char*>(vm::allocate_mappable(PAGE_SIZE, size_of_chunk));
 	cacheData = static_cast<char*>(vm::allocate_mappable(PAGE_SIZE, cachesize*PAGE_SIZE));
@@ -880,6 +1057,11 @@ void argo_initialize(std::size_t argo_size, std::size_t cache_size) {
 		cacheControl[i].state = INVALID;
 		cacheControl[i].dirty = CLEAN;
 	}
+	for(std::size_t i = 0; i < l2_cache_entries; i++) {
+		l2CacheControl[i].tag = GLOBAL_NULL;
+		l2CacheControl[i].state = INVALID;
+		l2CacheControl[i].dirty = CLEAN;
+	}
 
 	argo_reset_coherence();
 	double init_end = MPI_Wtime();
@@ -929,7 +1111,9 @@ void argo_finalize() {
 	delete[] mpi_lock_data;
 
 	MPI_Comm_free(&argo_comm);
-	MPI_Finalize();
+	if (argo_called_mpi_init) {
+		MPI_Finalize();
+	}
 	return;
 }
 
