@@ -343,6 +343,8 @@ extern std::uintptr_t* global_offsets_tbl;
  */
 extern void storepageDIFF(std::size_t index, std::uintptr_t addr);
 
+extern void storepageDIFF_l2(std::size_t index, std::uintptr_t addr);
+
 /*Write Buffer*/
 #include "write_buffer.hpp"  // Needed only in the line below
 /**
