@@ -290,13 +290,17 @@ void load_cache_entry(std::uintptr_t aligned_access_offset) {
 	/* Temporarily store remotely fetched cache data */
 	std::vector<char> temp_data(fetch_size*PAGE_SIZE);
 	std::vector<bool> l2_hit(fetch_size, false);
+	std::size_t local_l2_hits = 0;
+    std::size_t local_remote_misses = 0;
 
 	/* Write back existing cache entries if needed */
 	for(std::size_t idx = start_index, p = 0; idx < end_index; idx+=CACHELINE, p+=CACHELINE) {
 		/* Address and pointer to the data being loaded */
 		const std::size_t temp_addr = aligned_access_offset + p*block_size;
 		#ifdef ENABLE_L2
-		std::size_t l2_idx = getL2Index(cacheControl[idx].tag);
+        const std::uintptr_t old_tag = cacheControl[idx].tag;
+        std::size_t l2_victim_idx = getL2Index(old_tag);        // where to place the L1 victim
+        std::size_t l2_lookup_idx = getL2Index(temp_addr);      // where to look for the new page
 		#endif
 		if(cache_locks[idx].try_lock() || idx == start_index) {
 			/* Skip updating pages that are already present and valid in the cache */
@@ -305,29 +309,25 @@ void load_cache_entry(std::uintptr_t aligned_access_offset) {
 				cache_locks[idx].unlock();
 				continue;
 			}
-			// We shouldn't copy stuff back here, there might still be valid data in the l1 cache. 
-			// This big loop just checks if a page is present in the cache, eviction and fetching is handled down below
-			// But we need to somehow distinguish between a page is present in l1 or l2. Maybe that doesn't really matter, we just copy from l2 to l1 if its present there.
 			#ifdef ENABLE_L2
-			
-				/* Speculatively check L2 — if present, skip remote fetch
-				* but still proceed with eviction and promotion below */
-			l2_cache_locks[l2_idx].lock();
-				if(l2CacheControl[l2_idx].tag == temp_addr && l2CacheControl[l2_idx].state != INVALID) {
-					#ifdef PRINT_L2
-					printf("Node %u: Found %p in l2 id: %lu\n", workrank, (void*)((char*)startAddr + temp_addr), l2_idx);
-					#endif
-					pages_to_load[p] = false;
-					l2_hit[p] = true;
-				} else {
-					pages_to_load[p] = true;
-				}
-				l2_cache_locks[l2_idx].unlock();
-			
-					
-			
+			/* Check if the page is already in L2 */
+			l2_cache_locks[l2_lookup_idx].lock();
+			if(l2CacheControl[l2_lookup_idx].tag == temp_addr &&
+			l2CacheControl[l2_lookup_idx].state != INVALID) {
+			#ifdef PRINT_L2
+			printf("Node %u: Found %p in l2 id: %lu\n", workrank, (void*)((char*)startAddr + temp_addr), l2_lookup_idx);
+			#endif
+				pages_to_load[p] = false;
+				l2_hit[p] = true;
+				++local_l2_hits;
+			} else {
+				pages_to_load[p] = true;
+				++local_remote_misses;
+			}
+			l2_cache_locks[l2_lookup_idx].unlock();
 			#else
-			pages_to_load[p] = true;
+				pages_to_load[p] = true;
+				++local_remote_misses;  
 			#endif
 			} 
 		else 
@@ -341,61 +341,57 @@ void load_cache_entry(std::uintptr_t aligned_access_offset) {
             void* old_ptr = static_cast<char*>(startAddr) + cacheControl[idx].tag;
             void* temp_ptr = static_cast<char*>(startAddr) + temp_addr;
 
-            #ifdef ENABLE_L2
+ 			#ifdef ENABLE_L2
             if(!l2_hit[p]) {
-                // Begin the process of moving L1 victim to L2. Start by locking the L2. 
-				
-                if(l2_cache_locks[l2_idx].try_lock()) {
+                // Begin the process of moving L1 victim to L2.
+                if(l2_cache_locks[l2_victim_idx].try_lock()) {
                     bool l1_dirty = (cacheControl[idx].dirty == DIRTY);
-                    bool l2_dirty = (l2CacheControl[l2_idx].dirty == DIRTY);
-                    // First, evict the current L2 occupant if necessary
-                    if((l2CacheControl[l2_idx].tag != GLOBAL_NULL) && l2CacheControl[l2_idx].state != INVALID) {
-                        #ifdef PRINT_L2
-                        printf("Node %u Evicting page with global adress %p at l2 id: %lu \n", workrank, old_ptr, l2_idx);
-                        #endif
+                    bool l2_dirty = (l2CacheControl[l2_victim_idx].dirty == DIRTY);
+
+                    // Evict current L2 occupant if necessary
+                    if((l2CacheControl[l2_victim_idx].tag != GLOBAL_NULL) && l2CacheControl[l2_victim_idx].state != INVALID) {
+					#ifdef PRINT_L2
+                        printf("Node %u Evicting page with global adress %p at l2 id: %lu \n", workrank, old_ptr, l2_victim_idx);
+					#endif
                         if(l2_dirty) {
-                            // Write dirty L2 page back to remote using L2-specific diff
-                            #ifdef PRINT_L2
-                            printf("Node %u: Dirty page at %p in l2 id: %lu, storepageDIFF_l2\n", workrank, old_ptr, l2_idx );
-                            #endif
+							#ifdef PRINT_L2
+							printf("Node %u: Dirty page at %p in l2 id: %lu, storepageDIFF_l2\n", workrank, old_ptr, l2_victim_idx );
+							#endif
                             for(std::size_t j = 0; j < CACHELINE; j++) {
-                                storepageDIFF_l2(l2_idx+j, PAGE_SIZE*j+(l2CacheControl[l2_idx].tag));
+                                storepageDIFF_l2(l2_victim_idx+j, PAGE_SIZE*j+(l2CacheControl[l2_victim_idx].tag));
                             }
                         }
                     }
 
-                    // Now move the L1 victim into L2
-                    memcpy(l2CacheData + l2_idx*PAGE_SIZE, cacheData + idx*PAGE_SIZE, block_size);
+                    // Move the L1 victim into L2
+                    memcpy(l2CacheData + l2_victim_idx*PAGE_SIZE, cacheData + idx*PAGE_SIZE, block_size);
 
                     // Set up L2 twin page for future diffing
                     if(l1_dirty) {
-                        // The L1 pagecopy has the clean baseline; copy it to L2 pagecopy
-                        memcpy(l2pagecopy + l2_idx*PAGE_SIZE, pagecopy + idx*PAGE_SIZE, block_size);
-                        l2CacheControl[l2_idx].dirty = DIRTY;
+                        memcpy(l2pagecopy + l2_victim_idx*PAGE_SIZE, pagecopy + idx*PAGE_SIZE, block_size);
+                        l2CacheControl[l2_victim_idx].dirty = DIRTY;
                         argo_write_buffer->erase(idx);
                     } else {
-                        // Clean page: the data itself is the baseline
-                        memcpy(l2pagecopy + l2_idx*PAGE_SIZE, cacheData + idx*PAGE_SIZE, block_size);
-                        l2CacheControl[l2_idx].dirty = CLEAN;
+                        memcpy(l2pagecopy + l2_victim_idx*PAGE_SIZE, cacheData + idx*PAGE_SIZE, block_size);
+                        l2CacheControl[l2_victim_idx].dirty = CLEAN;
                     }
-                    l2CacheControl[l2_idx].tag = cacheControl[idx].tag;
-                    l2CacheControl[l2_idx].state = VALID;
+                    l2CacheControl[l2_victim_idx].tag   = old_tag;
+                    l2CacheControl[l2_victim_idx].state = VALID;
 
-                    l2_cache_locks[l2_idx].unlock();
+                    l2_cache_locks[l2_victim_idx].unlock();
                 } else {
-                    // Could not acquire L2 lock; fall back to direct writeback
+                    // Could not acquire L2 lock, fall back to direct writeback
                     if(cacheControl[idx].dirty == DIRTY) {
                         mprotect(old_ptr, block_size, PROT_READ);
                         for(std::size_t j = 0; j < CACHELINE; j++) {
                             storepageDIFF(idx+j, PAGE_SIZE*j+(cacheControl[idx].tag));
                         }
+						// Would be nice to track how many times we fail to acquire L2 lock
                         argo_write_buffer->erase(idx);
                     }
                 }
             } else {
-                // L2 hit: we're about to promote from L2, so the current L1
-                // occupant is being replaced. We need to write it back if dirty,
-                // but we can't put it in L2 (the L2 slot holds the page we want).
+                // L2 hit: the current L1 occupant is being replaced, but we cannot put it in L2 because the L2 slot holds the we want
                 if(cacheControl[idx].dirty == DIRTY) {
                     mprotect(old_ptr, block_size, PROT_READ);
                     for(std::size_t j = 0; j < CACHELINE; j++) {
@@ -404,7 +400,7 @@ void load_cache_entry(std::uintptr_t aligned_access_offset) {
                     argo_write_buffer->erase(idx);
                 }
             }
-            #else
+			#else
             if(cacheControl[idx].dirty == DIRTY) {
                 mprotect(old_ptr, block_size, PROT_READ);
                 for(std::size_t j = 0; j < CACHELINE; j++) {
@@ -412,40 +408,46 @@ void load_cache_entry(std::uintptr_t aligned_access_offset) {
                 }
                 argo_write_buffer->erase(idx);
             }
-            #endif
+			#endif
 
-            /* Clean up cache and protect memory — always runs regardless of L2 hit */
+            /* Clean up cache and protect memory */
             cacheControl[idx].state = INVALID;
-            cacheControl[idx].tag = temp_addr;
+            cacheControl[idx].tag   = temp_addr;
             cacheControl[idx].dirty = CLEAN;
             vm::map_memory(temp_ptr, block_size, PAGE_SIZE*idx, PROT_NONE);
             mprotect(old_ptr, block_size, PROT_NONE);
         }
-	}
+    }
 
-	/* Initialize classification_index_array */
-	for(std::size_t i = 0; i < fetch_size; i+=CACHELINE) {
-		const std::size_t temp_addr = aligned_access_offset + i*block_size;
-		classification_index_array[i] = get_classification_index(temp_addr);
-	}
+    /* Initialize classification_index_array */
+    for(std::size_t i = 0; i < fetch_size; i+=CACHELINE) {
+        const std::size_t temp_addr = aligned_access_offset + i*block_size;
+        classification_index_array[i] = get_classification_index(temp_addr);
+    }
 
-	/* Increase stat counter as load will be performed */
-	stats.read_misses.fetch_add(1);
+    /* Increase stat counter as load will be performed */
+    if(local_remote_misses) {
+        stats.read_misses.fetch_add(local_remote_misses);
+    }
+    if(local_l2_hits) {
+        stats.l2_read_hits.fetch_add(local_l2_hits);
+    }
 
-	/* Get globalSharers info from local node and add self to it */
-	sharer_op(MPI_LOCK_SHARED, workrank, classification_index_array[0],
-			[&](std::size_t) {
-		for(std::size_t i = 0; i < fetch_size; i+=CACHELINE) {
-			if(pages_to_load[i]) {
-				/* Check local pyxis directory if we are sharer of the page */
-				local_sharers[i] = (globalSharers[classification_index_array[i]])&node_id_bit;
-				if(local_sharers[i] == 0) {
-					sharer_bit_mask[i*2] = node_id_bit;
-					new_sharer = true;  // At least one new sharer detected
-				}
-			}
-		}
-	});
+
+    /* Get globalSharers info from local node and add self to it */
+    sharer_op(MPI_LOCK_SHARED, workrank, classification_index_array[0],
+            [&](std::size_t) {
+        for(std::size_t i = 0; i < fetch_size; i+=CACHELINE) {
+            if(pages_to_load[i]) {
+                /* Check local pyxis directory if we are sharer of the page */
+                local_sharers[i] = (globalSharers[classification_index_array[i]])&node_id_bit;
+                if(local_sharers[i] == 0) {
+                    sharer_bit_mask[i*2] = node_id_bit;
+                    new_sharer = true;  // At least one new sharer detected
+                }
+            }
+        }
+    });
 
 	std::size_t sharer_win_offset = get_sharer_win_offset(classification_index_array[0]);
 	/* If this node is a new sharer of at least one of the pages */
@@ -519,103 +521,114 @@ void load_cache_entry(std::uintptr_t aligned_access_offset) {
 
 	/* Finally, get the cache data and store it temporarily */
 	std::size_t win_index = get_data_win_index(load_offset);
-	std::size_t win_offset = get_data_win_offset(load_offset);
-	mpi_lock_data[win_index][load_node].lock(MPI_LOCK_SHARED, load_node, data_windows[win_index][load_node]);
-	MPI_Get(temp_data.data(), fetch_size, cacheblock,
-					load_node, win_offset, fetch_size, cacheblock, data_windows[win_index][load_node]);
-	mpi_lock_data[win_index][load_node].unlock(load_node, data_windows[win_index][load_node]);
+    std::size_t win_offset = get_data_win_offset(load_offset);
+    mpi_lock_data[win_index][load_node].lock(MPI_LOCK_SHARED, load_node, data_windows[win_index][load_node]);
+    MPI_Get(temp_data.data(), fetch_size, cacheblock,
+                    load_node, win_offset, fetch_size, cacheblock, data_windows[win_index][load_node]);
+    mpi_lock_data[win_index][load_node].unlock(load_node, data_windows[win_index][load_node]);
 
-	/* Update the cache */
-	for(std::size_t idx = start_index, p = 0; idx < end_index; idx+=CACHELINE, p+=CACHELINE) {
-		/* Update only the pages necessary */
-		const std::size_t temp_addr = aligned_access_offset + p*block_size;
-		#ifdef ENABLE_L2
-		std::size_t l2_idx = getL2Index(cacheControl[idx].tag );
-		#endif
-		if(pages_to_load[p]) {
-			/* Insert the data in the node cache */
-			#ifdef PRINT_L2
+    /* Update the cache */
+    for(std::size_t idx = start_index, p = 0; idx < end_index; idx+=CACHELINE, p+=CACHELINE) {
+        /* Update only the pages necessary */
+        const std::size_t temp_addr = aligned_access_offset + p*block_size;
+#ifdef ENABLE_L2
+        std::size_t l2_idx = getL2Index(cacheControl[idx].tag);
+#endif
+        if(pages_to_load[p]) {
+            /* Insert the data in the node cache */
+		#ifdef PRINT_L2
 			printf("Node %u: Copy page %p from remote to l1 id %lu \n", workrank, (void*)((char*)startAddr + temp_addr), idx);
-			#endif
-			memcpy(&cacheData[idx*block_size], &temp_data[p*block_size], block_size);
+		#endif
+            memcpy(&cacheData[idx*block_size], &temp_data[p*block_size], block_size);
 
-			void* temp_ptr = static_cast<char*>(startAddr) + temp_addr;
+            void* temp_ptr = static_cast<char*>(startAddr) + temp_addr;
 
-			/* If this is the first time inserting in to this index, perform vm map */
-			if(cacheControl[idx].tag == GLOBAL_NULL) {
-				vm::map_memory(temp_ptr, block_size, PAGE_SIZE*idx, PROT_READ);
-				cacheControl[idx].tag = temp_addr;
-			} else {
-				/* Else, just mprotect the region */
-				mprotect(temp_ptr, block_size, PROT_READ);
-			}
-			touchedcache[idx] = 1;
-			cacheControl[idx].state = VALID;
-			cacheControl[idx].dirty = CLEAN;
-			/* Unlock every lock but that for start_index */
-			if(idx != start_index) {
-				cache_locks[idx].unlock();
-			}
-		}
-		// Here we could probably do the copy from l2 to l1. I thought earlier that we need to distinguish between l1 and l2 placement. But maybe we can just do the copy here for all pages that are present in l2, and then we know for sure that the data is in l1 when we get here. 
-		// We need to secure (lock) both l1 and l2 cache when doing this copy in order to make sure that we avoid race conditions
-		// Secure l1 first and then l2
+            /* If this is the first time inserting in to this index, perform vm map */
+            if(cacheControl[idx].tag == GLOBAL_NULL) {
+                vm::map_memory(temp_ptr, block_size, PAGE_SIZE*idx, PROT_READ);
+                cacheControl[idx].tag = temp_addr;
+            } else {
+                /* Else, just mprotect the region */
+                mprotect(temp_ptr, block_size, PROT_READ);
+            }
+            touchedcache[idx] = 1;
+            cacheControl[idx].state = VALID;
+            cacheControl[idx].dirty = CLEAN;
+            /* Unlock every lock but that for start_index */
+            if(idx != start_index) {
+                cache_locks[idx].unlock();
+            }
+        }
 		#ifdef ENABLE_L2
-		
-		else {
+        else if(l2_hit[p]) {
+            /* Promote from L2 to L1 */
+            l2_cache_locks[l2_idx].lock();
 
-			l2_cache_locks[l2_idx].lock();
+            if(l2CacheControl[l2_idx].tag == temp_addr && l2CacheControl[l2_idx].state != INVALID) {
+		#ifdef PRINT_L2
+                printf("Node %u: Copy page %p in l2 id %lu to l1 id %lu \n",
+                       workrank,
+                       (void*)((char*)startAddr + l2CacheControl[l2_idx].tag),
+                       l2_idx, idx);
+		#endif
+                memcpy(&cacheData[idx*block_size], &l2CacheData[l2_idx*block_size], block_size);
 
-			if(l2CacheControl[l2_idx].tag == temp_addr && l2CacheControl[l2_idx].state != INVALID) {
-				#ifdef PRINT_L2
-				printf("Node %u: Copy page %p in l2 id %lu to l1 id %lu \n", workrank, (void*)((char*)startAddr + l2CacheControl[l2_idx].tag), l2_idx, idx);
-				#endif
-				memcpy(&cacheData[idx*block_size], &l2CacheData[l2_idx*block_size], block_size);
-				void* temp_ptr = static_cast<char*>(startAddr) + temp_addr;
+                void* temp_ptr = static_cast<char*>(startAddr) + temp_addr;
 
-				mprotect(temp_ptr, block_size, PROT_READ);
-				
-				argo_byte l2_dirty = l2CacheControl[l2_idx].dirty;
-				if(l2_dirty == DIRTY) {
+                mprotect(temp_ptr, block_size, PROT_READ);
+
+                argo_byte l2_dirty = l2CacheControl[l2_idx].dirty;
+                if(l2_dirty == DIRTY) {
                     /* Copy L2 baseline to L1 pagecopy so L1 can diff correctly */
-                    memcpy(pagecopy + idx*PAGE_SIZE, l2pagecopy + l2_idx*PAGE_SIZE, block_size);
+                    memcpy(pagecopy + idx*PAGE_SIZE,
+                           l2pagecopy + l2_idx*PAGE_SIZE,
+                           block_size);
                     mprotect(temp_ptr, block_size, PROT_READ|PROT_WRITE);
-				}
-				l2CacheControl[l2_idx].state = INVALID;
+                }
+                l2CacheControl[l2_idx].state = INVALID;
+                
 				l2_cache_locks[l2_idx].unlock();
-				cacheControl[idx].state = VALID;
-				cacheControl[idx].dirty = l2_dirty;
-				// if(cacheControl[idx].dirty == DIRTY) {
-				// 	memcpy(pagecopy+(idx*PAGE_SIZE), cacheData+(idx*block_size), block_size);
-				//     mprotect(temp_ptr, block_size, PROT_READ|PROT_WRITE);
-				// }
-				touchedcache[idx] = 1;
-				if(idx != start_index) {
-					cache_locks[idx].unlock();
-				}
-				#ifdef PRINT_L2
-				printf("Node %u: %p l2 %lu -> l1 %lu complete\n", workrank, (void*)((char*)startAddr + l2CacheControl[idx].tag), idx, idx);
-				#endif
 
-			}
-			else {
-				l2_cache_locks[l2_idx].unlock();
+                cacheControl[idx].state = VALID;
+                cacheControl[idx].dirty = l2_dirty;
+                touchedcache[idx] = 1;
+                
 				if(idx != start_index) {
                     cache_locks[idx].unlock();
                 }
-			}
-			#ifdef PRINT_L2
-			#endif
-		}
-		
-		#else
-		else {
-			cache_locks[idx].unlock();
-		}
-		#endif 
-
-
-	}
+		#ifdef PRINT_L2
+                printf("Node %u: %p l2 %lu -> l1 %lu complete\n",
+                       workrank,
+                       (void*)((char*)startAddr + l2CacheControl[idx].tag),
+                       idx, idx);
+		#endif
+            } else {
+                /* L2 entry was evicted in the meantime, leave line invalid */
+                l2_cache_locks[l2_idx].unlock();
+                cacheControl[idx].state = INVALID;
+                cacheControl[idx].dirty = CLEAN;
+                if(idx != start_index) {
+                    cache_locks[idx].unlock();
+                }
+            }
+        }
+        else {
+            /* pages_to_load[p] == false and no L2 hit:
+             * either page was already in L1 (we unlocked earlier),
+             * or we failed to acquire the L1 lock. Do nothing. */
+            if(idx == start_index) {
+                /* start_index lock is managed by caller */
+            }
+        }
+#else
+        else {
+            /* No remote load, no L2: nothing to do */
+            if(idx == start_index) {
+                /* start_index lock is managed by caller */
+            }
+        }
+#endif
+    }
 }
 
 
@@ -1095,11 +1108,16 @@ void argo_initialize(std::size_t argo_size, std::size_t cache_size) {
 }
 
 void argo_finalize() {
+	fprintf(stderr, "[%d] finalize: enter\n", workrank);
 	swdsm_argo_barrier(1);
 	if(workrank == 0) {
 		printf("ArgoDSM shutting down\n");
 	}
+	fprintf(stderr, "[%d] finalize: before print_statistics\n", workrank);
+    fprintf(stderr, "[%d] finalize: before node barrier\n", workrank);
 	swdsm_argo_barrier(1);
+	fprintf(stderr, "[%d] finalize: after node barrier\n", workrank);
+
 	stats.exectime = MPI_Wtime() - stats.exectime;
 	mprotect(startAddr, size_of_all, PROT_WRITE|PROT_READ);
 	MPI_Barrier(argo_comm);
@@ -1109,21 +1127,27 @@ void argo_finalize() {
     numa_free(l2pagecopy, cachesize * PAGE_SIZE);
     #endif
 	print_statistics();
+    fprintf(stderr, "[%d] finalize: before mpi barrier\n", workrank);
 
 	MPI_Barrier(argo_comm);
-
+	fprintf(stderr, "[%d] finalize: after mpi barrier\n", workrank);
+	fprintf(stderr, "[%d] finalize: before free data \n", workrank);
 	// Free data windows
 	for(auto& win_index : data_windows) {
 		for(auto& window : win_index) {
 			MPI_Win_free(&window);
 		}
 	}
+	fprintf(stderr, "[%d] finalize: after free data \n", workrank);
 	// Free sharer windows
+	fprintf(stderr, "[%d] finalize: before free sharer\n", workrank);
 	for(auto& win_index : sharer_windows) {
 		for(auto& window : win_index) {
 			MPI_Win_free(&window);
 		}
 	}
+	fprintf(stderr, "[%d] finalize: after free sharer\n", workrank);
+	fprintf(stderr, "[%d] finalize: before first touch check\n", workrank);
 	if (dd::is_first_touch_policy()) {
 		MPI_Win_free(&owners_dir_window);
 		MPI_Win_free(&offsets_tbl_window);
@@ -1138,11 +1162,12 @@ void argo_finalize() {
 		delete[] mpi_lock_data[i];
 	}
 	delete[] mpi_lock_data;
-
+    fprintf(stderr, "[%d] finalize: before MPI_Finalize\n", workrank);
 	MPI_Comm_free(&argo_comm);
 	if (argo_called_mpi_init) {
 		MPI_Finalize();
 	}
+	fprintf(stderr, "[%d] finalize: after MPI_Finalize\n", workrank);
 	return;
 }
 
@@ -1408,6 +1433,7 @@ void argo_reset_stats() {
 	stats.locks = 0;
 	stats.ssi_time = 0;
 	stats.ssd_time = 0;
+	stats.l2_read_hits.store(0);
 
 	// Clear the cache lock statistics
 	for(auto& cache_lock : cache_locks) {
@@ -1687,6 +1713,8 @@ void print_statistics() {
 				printf("#  " CYN "# Remote accesses\n" RESET);
 				printf("#  read misses: %12lu    access time: %12.4fs\n",
 						stats.read_misses.load(), stats.load_time);
+				printf("#  L2 read hits:         %8lu\n",
+                        stats.l2_read_hits.load());
 				printf("#  write misses: %11lu    access time: %12.4fs\n",
 						stats.write_misses.load(), stats.store_time);
 
