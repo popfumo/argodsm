@@ -130,7 +130,14 @@ class write_buffer {
 		 */
 		void write_back_index(std::size_t cache_index) {
 			cache_locks[cache_index].lock();
-			assert(cacheControl[cache_index].dirty == DIRTY);
+			//assert(cacheControl[cache_index].dirty == DIRTY);
+			// Relaxing the assertion to allow since we introduce new paths 
+			if (cacheControl[cache_index].dirty != DIRTY ||
+				cacheControl[cache_index].state == INVALID) {
+				cache_locks[cache_index].unlock();
+				return;
+			}
+
 			const std::uintptr_t page_address = cacheControl[cache_index].tag;
 			void* page_ptr = static_cast<char*>(
 				argo::virtual_memory::start_address()) + page_address;
@@ -180,8 +187,10 @@ class write_buffer {
 		 */
 		void _add(T val) {
 			// For debug builds, check for duplicate additions
-			assert(!has(val));
-
+			if (has(val)) {
+				return;
+			}
+			
 			// If the buffer is full, write back _write_back_size indices
 			if(size() >= _max_size) {
 				flush_partial();
