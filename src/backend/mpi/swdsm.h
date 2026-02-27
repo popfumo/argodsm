@@ -110,6 +110,8 @@ typedef struct argo_statistics_struct {
 		/** @brief Mutex to update ssd_time */
 		std::mutex ssd_time_mutex;
 		
+		std::atomic<std::size_t> l2_evictions;
+
 		std::atomic<std::size_t> l2_read_hits;
 
 } argo_statistics;
