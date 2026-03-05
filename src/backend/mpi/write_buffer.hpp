@@ -130,13 +130,17 @@ class write_buffer {
 		 */
 		void write_back_index(std::size_t cache_index) {
 			cache_locks[cache_index].lock();
-			//assert(cacheControl[cache_index].dirty == DIRTY);
-			// Relaxing the assertion to allow since we introduce new paths 
-			if (cacheControl[cache_index].dirty != DIRTY ||
-				cacheControl[cache_index].state == INVALID) {
-				cache_locks[cache_index].unlock();
-				return;
+			if(cacheControl[cache_index].dirty != DIRTY)
+			{
+				printf("cached page at index %lu was CLEAN during attempted writeback \n", cache_index);
 			}
+			assert(cacheControl[cache_index].dirty == DIRTY);
+
+			// if (cacheControl[cache_index].dirty != DIRTY ||
+			// 	cacheControl[cache_index].state == INVALID) {
+			// 	cache_locks[cache_index].unlock();
+			// 	return;
+			// }
 
 			const std::uintptr_t page_address = cacheControl[cache_index].tag;
 			void* page_ptr = static_cast<char*>(
@@ -187,9 +191,12 @@ class write_buffer {
 		 */
 		void _add(T val) {
 			// For debug builds, check for duplicate additions
-			if (has(val)) {
-				return;
-			}
+			assert(!has(val));
+			// Does not contain actual data, just references to data. You need to be absolutely sure that buffer represents the actual state.
+			// When you evict
+			// if (has(val)) {
+			// 	return;
+			// }
 			
 			// If the buffer is full, write back _write_back_size indices
 			if(size() >= _max_size) {

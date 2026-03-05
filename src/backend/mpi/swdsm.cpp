@@ -21,14 +21,27 @@ namespace vm = argo::virtual_memory;
 namespace sig = argo::signal;
 namespace env = argo::env;
 
+// First thing to check for if its possible, we have an inflight write operation that is causing a page fault (page is not yet marked dirty)
+// BUT its in flight, and we have a read operation that causes a evict in l1 becuase you want to read it, directly after replacement write operation comes and think that it its the old one with only read access
+// When we you access it for the first time you get read access, if you want to write, you trigger a second fault. Is there a race between getting write access and page is being replaced?
+// If remote access only, we know excactly where it can happen. Introducing new L2 will give new paths. 
+// Probably is that we accidentally give clean page write permission and its placed in the buffer.
+// affects the page if moved to l2, multiple calls to the handler in flight. Handler calls are serialized, not knowing which order.
+// 
+
 #define ENABLE_L2
+// Introduce a synthetic latency for l1 misses to make l2 hits more visible in benchmarks
+//#define L1_NOOP
 //#define PRINT_L2
+
+#define S_PRINT
 /*Barrier*/
 /** @brief  Locks access to part that does SD in the global barrier */
 pthread_mutex_t barriermutex = PTHREAD_MUTEX_INITIALIZER;
 /** @brief Thread local barrier used to first wait for all local threads in the global barrier*/
 pthread_barrier_t *threadbarrier;
 
+static const std::size_t L2_PAGE_NOT_FOUND = -1;
 
 /*Pagecache*/
 /** @brief  Size of the cache in number of pages*/
@@ -57,6 +70,7 @@ control_data * l2CacheControl;
 /** @brief  The local l2 page cache*/
 char* l2CacheData;
 /** @brief Pointer to locks protecting the l2 page cache */
+// Sucks for high contention
 std::vector<cache_lock> l2_cache_locks;
 /** @brief Copy of the l2 cache to keep twinpages for later being able to DIFF stores */
 
@@ -149,10 +163,6 @@ std::size_t getCacheIndex(std::uintptr_t addr) {
 	std::size_t index = (addr/PAGE_SIZE) % cachesize;
 	return index;
 }
-std::size_t getL2CacheIndex(std::uintptr_t addr) {
-	std::size_t index = (addr/PAGE_SIZE) % cachesize;
-	return index;
-}
 
 #ifdef ENABLE_L2
 
@@ -194,7 +204,7 @@ inline std::size_t l2_find_line(std::size_t set, std::uintptr_t tag) {
             return idx;
         }
     }
-    return static_cast<std::size_t>(-1);
+    return L2_PAGE_NOT_FOUND;
 }
 
 /**
@@ -392,9 +402,10 @@ void load_cache_entry(std::uintptr_t aligned_access_offset) {
 	std::size_t local_l2_hits = 0;
     std::size_t local_remote_misses = 0;
     std::size_t local_l2_evictions = 0;
-
-
-
+	#ifdef ENABLE_L2
+	// TODO: Use malloc instead. 
+	std::vector<char> temp_l2_data(fetch_size*PAGE_SIZE);
+	#endif
 	/* Per-page L2 index found during lookup, valid only when l2_hit[p] is true */
     std::vector<std::size_t> l2_hit_idx(fetch_size, static_cast<std::size_t>(-1));
     /* Per-page L2 set, valid only when l2_hit[p] is true.
@@ -419,7 +430,7 @@ void load_cache_entry(std::uintptr_t aligned_access_offset) {
                 const std::size_t l2_set = l2_get_set_from_addr(temp_addr);
                 l2_lock_set(l2_set);
                 std::size_t l2_idx = l2_find_line(l2_set, temp_addr);
-                if(l2_idx != static_cast<std::size_t>(-1)) {
+                if(l2_idx != L2_PAGE_NOT_FOUND) {
 #ifdef PRINT_L2
                     printf("Node %u: Found %p in l2 set %lu way-idx %lu\n",
                         workrank, (void*)((char*)startAddr + temp_addr), l2_set, l2_idx);
@@ -428,16 +439,21 @@ void load_cache_entry(std::uintptr_t aligned_access_offset) {
                     l2_hit[p] = true;
                     l2_hit_idx[p] = l2_idx;
                     l2_hit_set[p] = l2_set;
+					// std::bool is a fixed array given the size. ALL other vector types are dynamically allocated, meaning that if you exceed the max size, it will allocate a new one larger and copy it
+					memcpy(&temp_l2_data[p*block_size], &l2CacheData[l2_idx*block_size], block_size);
+					l2CacheControl[l2_idx].state = INVALID;
                     ++local_l2_hits;
                 } else {
                     pages_to_load[p] = true;
                     ++local_remote_misses;
-                    l2_unlock_set(l2_set);
                 }
+				l2_unlock_set(l2_set);  // release set lock immediately since we only needed it for the lookup
             }
-#else
-            pages_to_load[p] = true;
-            ++local_remote_misses;
+#else		
+			else {
+				pages_to_load[p] = true;
+				++local_remote_misses;
+			}
 #endif
         }
         else
@@ -454,7 +470,7 @@ void load_cache_entry(std::uintptr_t aligned_access_offset) {
 #ifdef ENABLE_L2
             {
                 bool l1_dirty = (cacheControl[idx].dirty == DIRTY);
-
+				// Should also probably check if it's invalid...?
                 if(l1_dirty) {
                     // Dirty victims are written back directly
                     mprotect(old_ptr, block_size, PROT_READ);
@@ -464,20 +480,13 @@ void load_cache_entry(std::uintptr_t aligned_access_offset) {
                     argo_write_buffer->erase(idx);
                 } else {
                     // Clean victims are inserted into L2 using set-associative placement
-					const std::uintptr_t old_tag = cacheControl[idx].tag;
+                    const std::uintptr_t old_tag = cacheControl[idx].tag;
                     const std::size_t victim_set = l2_get_set_from_addr(old_tag);
-
-                    // If the victim set is the same set we're holding for an L2 hit,
-                    // we already have the lock. Otherwise lock it.
-
-                    bool already_locked = l2_hit[p] && (victim_set == l2_hit_set[p]);
-                    if(!already_locked) {
-                        l2_lock_set(victim_set);
-                    }
+                    l2_lock_set(victim_set);
 
                     // Check if already in L2
                     std::size_t existing = l2_find_line(victim_set, old_tag);
-                    if(existing == static_cast<std::size_t>(-1)) {
+                    if(existing == L2_PAGE_NOT_FOUND) {
                         // Choose a victim way
                         std::size_t l2_victim = l2_choose_victim(victim_set);
 
@@ -485,26 +494,10 @@ void load_cache_entry(std::uintptr_t aligned_access_offset) {
                             local_l2_evictions++;
                         }
 
-                        // Make sure we don't evict the line we are about to promote
-                        if(l2_hit[p] && l2_victim == l2_hit_idx[p]) {
-                            // Pick a different victim - find LRU excluding our hit
-                            std::size_t alt_lru_idx = static_cast<std::size_t>(-1);
-                            std::uint32_t alt_lru_val = UINT32_MAX;
-                            for(std::size_t way = 0; way < L2_ASSOCIATIVITY; ++way) {
-                                const auto candidate = l2_line_index(victim_set, way);
-                                if(candidate != l2_hit_idx[p] && l2_lru_counters[candidate] < alt_lru_val) {
-                                    alt_lru_val = l2_lru_counters[candidate];
-                                    alt_lru_idx = candidate;
-                                }
-                            }
-                            if(alt_lru_idx != static_cast<std::size_t>(-1)) {
-                                l2_victim = alt_lru_idx;
-                            }
-                            
-                        }
-
-                        // Evict the old L2 line 
-                        l2CacheControl[l2_victim].state = INVALID;
+						// We assume that all pages are clean in L2, good to double check
+						assert(l2CacheControl[l2_victim].dirty == CLEAN);
+                        // Evict the old L2 line
+						l2CacheControl[l2_victim].state = INVALID;
 
                         // Copy clean data from L1 to L2
                         memcpy(l2CacheData + l2_victim * block_size,
@@ -520,9 +513,7 @@ void load_cache_entry(std::uintptr_t aligned_access_offset) {
                         l2_touch(existing);
                     }
 
-                    if(!already_locked) {
-                        l2_unlock_set(victim_set);
-                    }
+                    l2_unlock_set(victim_set);
                 }
             }
 #else
@@ -662,10 +653,6 @@ for(std::size_t idx = start_index, p = 0; idx < end_index; idx+=CACHELINE, p+=CA
 
         if(pages_to_load[p]) {
             /* Insert the data in the node cache */
-#ifdef PRINT_L2
-            printf("Node %u: Copy page %p from remote to l1 id %lu \n",
-                workrank, (void*)((char*)startAddr + temp_addr), idx);
-#endif
             memcpy(&cacheData[idx*block_size], &temp_data[p*block_size], block_size);
 
             void* temp_ptr = static_cast<char*>(startAddr) + temp_addr;
@@ -682,25 +669,32 @@ for(std::size_t idx = start_index, p = 0; idx < end_index; idx+=CACHELINE, p+=CA
             cacheControl[idx].state = VALID;
             cacheControl[idx].dirty = CLEAN;
             /* Unlock every lock but that for start_index */
+			#ifdef L1_NOOP
+			// Simulate RDMA network latency for remote page fetches.
+			// Only delays pages actually fetched remotely (not L2 hits).
+			// Uses nanosleep to avoid burning CPU (real RDMA is NIC-offloaded).
+			// ~20µs approximates: sharer directory ops + MPI_Get + unlock on InfiniBand.
+			if(local_remote_misses > 0) {
+				struct timespec ts;
+				ts.tv_sec = 0;
+				ts.tv_nsec = 20000;  // 20 µs
+				nanosleep(&ts, nullptr);
+			}
+			#endif
+
             if(idx != start_index) {
                 cache_locks[idx].unlock();
             }
         }
 #ifdef ENABLE_L2
         else if(l2_hit[p]) {
-            // L2 set lock is still held from the lookup phase — no race possible.
-            const std::size_t l2_idx = l2_hit_idx[p];
-            const std::size_t l2_set = l2_hit_set[p];
-
-            // The line must still be valid since we held the set lock
-            assert(l2CacheControl[l2_idx].state != INVALID);
-            assert(l2CacheControl[l2_idx].tag == temp_addr);
-
+            // Data was already copied into temp_l2_data during lookup.
+            // L2 entry was already invalidated. No L2 lock needed here.
             memcpy(&cacheData[idx*block_size],
-                   &l2CacheData[l2_idx*block_size],
+                   &temp_l2_data[p*block_size],
                    block_size);
-
-            void* temp_ptr = static_cast<char*>(startAddr) + temp_addr;
+			// Don't use void pointer
+            char* temp_ptr = static_cast<char*>(startAddr) + temp_addr;
 
             if(cacheControl[idx].tag == GLOBAL_NULL) {
                 vm::map_memory(temp_ptr, block_size, PAGE_SIZE*idx, PROT_READ);
@@ -712,12 +706,6 @@ for(std::size_t idx = start_index, p = 0; idx < end_index; idx+=CACHELINE, p+=CA
             cacheControl[idx].state = VALID;
             cacheControl[idx].dirty = CLEAN;
             touchedcache[idx] = 1;
-
-            // Invalidate L2 entry after promotion
-            l2CacheControl[l2_idx].state = INVALID;
-
-            // Now release the L2 set lock
-            l2_unlock_set(l2_set);
 
             if(idx != start_index) {
                 cache_locks[idx].unlock();
@@ -969,9 +957,9 @@ void handler(int sig, siginfo_t *si, void *context) {
 	unsigned char* copy = reinterpret_cast<unsigned char*>(pagecopy + line*PAGE_SIZE);
 	memcpy(copy, aligned_access_ptr, PAGE_SIZE*CACHELINE);
 	mprotect(aligned_access_ptr, PAGE_SIZE*CACHELINE, PROT_WRITE|PROT_READ);
-	cache_locks[startIndex].unlock();
 	double t2 = MPI_Wtime();
 	argo_write_buffer->add(startIndex);
+	cache_locks[startIndex].unlock();
 	std::lock_guard<std::mutex> store_lock(stats.store_time_mutex);
 	stats.store_time += t2-t1;
 	return;
@@ -1091,7 +1079,6 @@ void argo_initialize(std::size_t argo_size, std::size_t cache_size) {
 	cacheoffset = PAGE_SIZE*cachesize+cacheControlSize;
 
 	#ifdef ENABLE_L2
-	
    	l2_num_sets = cachesize / CACHELINE;  // one set per L1 line
     l2_num_lines = l2_num_sets * L2_ASSOCIATIVITY;
     std::size_t l2CacheControlSize = sizeof(control_data) * l2_num_lines;
@@ -1254,7 +1241,9 @@ void argo_finalize() {
 	fprintf(stderr, "[%d] finalize: after free data \n", workrank);
 	#endif
 	// Free sharer windows
+	#ifdef PRINT_L2
 	fprintf(stderr, "[%d] finalize: before free sharer\n", workrank);
+	#endif
 	for(auto& win_index : sharer_windows) {
 		for(auto& window : win_index) {
 			MPI_Win_free(&window);
@@ -1332,26 +1321,14 @@ void self_invalidation() {
 			}
 		}
 	}
-	#ifdef ENABLE_L2
+    #ifdef ENABLE_L2
     for(std::size_t i = 0; i < l2_num_lines; i++) {
         if(l2CacheControl[i].state != INVALID) {
-            std::uintptr_t l2Addr = l2CacheControl[i].tag;
-            std::size_t l2classidx = get_classification_index(l2Addr);
-            std::uint64_t id = static_cast<std::uint64_t>(1) << workrank;
-
-            std::size_t win_index = get_sharer_win_index(l2classidx);
-            mpi_lock_sharer[win_index][workrank].lock(MPI_LOCK_SHARED, workrank, sharer_windows[win_index][workrank]);
-            bool keep = (globalSharers[l2classidx+1] == id) ||
-                        ((globalSharers[l2classidx+1] == 0) && ((globalSharers[l2classidx]&id) == id));
-            mpi_lock_sharer[win_index][workrank].unlock(workrank, sharer_windows[win_index][workrank]);
-
-            if(!keep) {
-                l2_cache_locks[i].lock();
-                if(l2CacheControl[i].state != INVALID) {
-                    l2CacheControl[i].dirty = CLEAN;
-                    l2CacheControl[i].state = INVALID;
-                }
-                l2_cache_locks[i].unlock();
+            std::uintptr_t l2_tag = l2CacheControl[i].tag;
+            std::size_t l1_idx = getCacheIndex(l2_tag);
+            if(touchedcache[l1_idx] == 0 ||
+               cacheControl[l1_idx].tag != l2_tag) {
+                l2CacheControl[i].state = INVALID;
             }
         }
     }
@@ -1400,13 +1377,11 @@ void self_upgrade(argo::backend::upgrade_type upgrade) {
                 #ifdef ENABLE_L2
                 {
                     const std::size_t l2_set = l2_get_set_from_addr(page_addr);
-                    l2_lock_set(l2_set);
                     std::size_t l2_idx = l2_find_line(l2_set, page_addr);
                     if(l2_idx != static_cast<std::size_t>(-1)) {
                         l2CacheControl[l2_idx].dirty = CLEAN;
                         l2CacheControl[l2_idx].state = INVALID;
                     }
-                    l2_unlock_set(l2_set);
                 }
                 #endif
 
@@ -1754,6 +1729,14 @@ void print_statistics() {
 			order++;
 			mem_size_readable /= 1024;
 		}
+		#ifdef ENABLE_L2
+		std::size_t l2_order = 0;
+		double l2_size_readable = l2_num_lines * PAGE_SIZE;
+		while (l2_size_readable >= 1024 && order < sizes.size()-1) {
+			l2_order++;
+			l2_size_readable /= 1024;
+		}
+		#endif
 
 		/* Print general information */
 		printf("\n#################################" YEL" ArgoDSM statistics " RESET "##################################\n");
@@ -1767,6 +1750,10 @@ void print_statistics() {
 				env::allocation_policy(), env::allocation_block_size(), env::load_size());
 		printf("#  active time: %12.4fs   init time: %14.4fs\n",
 				stats.exectime, stats.inittime);
+		#ifdef ENABLE_L2
+		printf("#  L2 associativity: %ld\n", L2_ASSOCIATIVITY);
+		printf("#  L2 cache size: %f%s (%ldp)\n", l2_size_readable, sizes[l2_order], l2_num_lines);
+		#endif
 		printf("\n");
 	}
 
@@ -1775,6 +1762,23 @@ void print_statistics() {
 		for(argo::num_nodes_t i = 0; i < numtasks; i++) {
 			MPI_Barrier(argo_comm);
 			if(i == workrank) {
+				#ifdef S_PRINT
+				printf("Process %d\n", workrank);
+				printf("read misses: %lu access time: %fs\n", stats.read_misses.load(), stats.load_time);
+				printf("L2 read hits: %lu\n", stats.l2_read_hits.load());
+				printf("L2 evictions: %lu\n", stats.l2_evictions.load());
+				printf("write misses: %lu access time: %fs\n", stats.write_misses.load(), stats.store_time);
+				(void)data_local_avg_lock_time;
+				(void)data_local_avg_hold_time;
+				(void)data_mpi_avg_lock_time;
+				(void)data_mpi_avg_unlock_time;
+				(void)sharer_local_avg_lock_time;
+				(void)sharer_local_avg_hold_time;
+				(void)sharer_mpi_avg_lock_time;
+				(void)sharer_mpi_avg_unlock_time;
+				(void)sharer_mpi_avg_hold_time;
+				(void)data_mpi_avg_hold_time;
+				#else
 				printf("#" YEL "  ### PROCESS ID %d ###\n" RESET, workrank);
 
 				/* Print remote access info */
@@ -1837,6 +1841,7 @@ void print_statistics() {
 							sharer_mpi_hold_time, sharer_mpi_avg_hold_time, sharer_mpi_max_hold_time);
 				}
 				printf("\n");
+				#endif
 			}
 		}
 	}
