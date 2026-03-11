@@ -34,7 +34,7 @@ namespace env = argo::env;
 //#define L1_NOOP
 //#define PRINT_L2
 
-#define S_PRINT
+//#define S_PRINT
 /*Barrier*/
 /** @brief  Locks access to part that does SD in the global barrier */
 pthread_mutex_t barriermutex = PTHREAD_MUTEX_INITIALIZER;
@@ -64,6 +64,9 @@ char* cacheData;
 char * pagecopy;
 /** @brief Pointer to locks protecting the page cache */
 std::vector<cache_lock> cache_locks;
+
+std::uintptr_t* write_buffer_tags;
+
 #ifdef ENABLE_L2
 /** @brief  Keeps state, tag and dirty bit of the l2 victim cache*/
 control_data * l2CacheControl;
@@ -74,7 +77,7 @@ char* l2CacheData;
 std::vector<cache_lock> l2_cache_locks;
 /** @brief Copy of the l2 cache to keep twinpages for later being able to DIFF stores */
 
-constexpr std::size_t L2_ASSOCIATIVITY = 8;
+std::size_t L2_ASSOCIATIVITY;
 std::size_t l2_num_sets = 0;
 std::size_t l2_num_lines = 0;
 /** @brief LRU counter per L2 line. Higher = more recently used */
@@ -166,11 +169,21 @@ std::size_t getCacheIndex(std::uintptr_t addr) {
 
 #ifdef ENABLE_L2
 
+
+/** @brief Get the L2 set index from the global memory address 
+ * @param addr The global memory address
+ * @return The L2 set index corresponding to the given address
+*/
 inline std::size_t l2_get_set_from_addr(std::uintptr_t addr) {
     const std::size_t line = addr / (PAGE_SIZE * CACHELINE);
     return (line % l2_num_sets);
 }
 
+/**
+ * @brief Get the L2 set index from the L1 cache index
+ * @param l1_index The L1 cache index
+ * @return The L2 set index corresponding to the given L1 cache index
+ */
 inline std::size_t l2_get_set_from_l1_index(std::size_t l1_index) {
     const std::size_t line = l1_index / CACHELINE;
     return (line % l2_num_sets);
@@ -431,10 +444,6 @@ void load_cache_entry(std::uintptr_t aligned_access_offset) {
                 l2_lock_set(l2_set);
                 std::size_t l2_idx = l2_find_line(l2_set, temp_addr);
                 if(l2_idx != L2_PAGE_NOT_FOUND) {
-#ifdef PRINT_L2
-                    printf("Node %u: Found %p in l2 set %lu way-idx %lu\n",
-                        workrank, (void*)((char*)startAddr + temp_addr), l2_set, l2_idx);
-#endif
                     pages_to_load[p] = false;
                     l2_hit[p] = true;
                     l2_hit_idx[p] = l2_idx;
@@ -466,7 +475,7 @@ void load_cache_entry(std::uintptr_t aligned_access_offset) {
         if((cacheControl[idx].tag != temp_addr) && (cacheControl[idx].tag != GLOBAL_NULL)) {
             void* old_ptr = static_cast<char*>(startAddr) + cacheControl[idx].tag;
             void* temp_ptr = static_cast<char*>(startAddr) + temp_addr;
-
+			write_buffer_tags[idx] = GLOBAL_NULL;
 #ifdef ENABLE_L2
             {
                 bool l1_dirty = (cacheControl[idx].dirty == DIRTY);
@@ -477,7 +486,11 @@ void load_cache_entry(std::uintptr_t aligned_access_offset) {
                     for(std::size_t j = 0; j < CACHELINE; j++) {
                         storepageDIFF(idx+j, PAGE_SIZE*j + cacheControl[idx].tag);
                     }
-                    argo_write_buffer->erase(idx);
+					// This is extremely suspect, uncommenting this line and enabling L2 causes a deadlock.
+					// Probable reason is that the thread that holds the QD lock is waiting for the thread that delegated it
+					// fprintf(stderr, "[DEADLOCK DBG] thread=%zu holding cache_lock[%zu], attempting write_buffer erase\n",
+    				// std::hash<std::thread::id>{}(std::this_thread::get_id()), idx);
+                    // argo_write_buffer->erase(idx);
                 } else {
                     // Clean victims are inserted into L2 using set-associative placement
                     const std::uintptr_t old_tag = cacheControl[idx].tag;
@@ -954,12 +967,14 @@ void handler(int sig, siginfo_t *si, void *context) {
 			}
 		}
 	}
+	write_buffer_tags[line] = cacheControl[line].tag;
 	unsigned char* copy = reinterpret_cast<unsigned char*>(pagecopy + line*PAGE_SIZE);
 	memcpy(copy, aligned_access_ptr, PAGE_SIZE*CACHELINE);
 	mprotect(aligned_access_ptr, PAGE_SIZE*CACHELINE, PROT_WRITE|PROT_READ);
 	double t2 = MPI_Wtime();
-	argo_write_buffer->add(startIndex);
 	cache_locks[startIndex].unlock();
+	argo_write_buffer->add(startIndex);
+	
 	std::lock_guard<std::mutex> store_lock(stats.store_time_mutex);
 	stats.store_time += t2-t1;
 	return;
@@ -1056,10 +1071,17 @@ void argo_initialize(std::size_t argo_size, std::size_t cache_size) {
 	classificationSize = 2*(argo_size/PAGE_SIZE);
 	argo_write_buffer = new write_buffer<std::size_t>();
 
-
 	// Allocate local memory for each node
 	size_of_all = argo_size;      // total distr. global memory
 	GLOBAL_NULL = size_of_all+1;
+
+
+	write_buffer_tags = static_cast<std::uintptr_t*>(
+        malloc(sizeof(std::uintptr_t) * cachesize));
+	for(std::size_t i = 0; i < cachesize; ++i) {
+        write_buffer_tags[i] = GLOBAL_NULL;
+    }
+
 	size_of_chunk = argo_size/(numtasks);  // part on each node
 	sig::signal_handler<SIGSEGV>::install_argo_handler(&handler);
 
@@ -1079,15 +1101,17 @@ void argo_initialize(std::size_t argo_size, std::size_t cache_size) {
 	cacheoffset = PAGE_SIZE*cachesize+cacheControlSize;
 
 	#ifdef ENABLE_L2
+	L2_ASSOCIATIVITY = env::l2_associativity();
    	l2_num_sets = cachesize / CACHELINE;  // one set per L1 line
-    l2_num_lines = l2_num_sets * L2_ASSOCIATIVITY;
+    l2_num_lines = l2_num_sets * env::l2_associativity();
     std::size_t l2CacheControlSize = sizeof(control_data) * l2_num_lines;
     l2CacheControlSize = align_forwards(l2CacheControlSize, PAGE_SIZE);
     l2_cache_locks.resize(l2_num_lines);
-
+	
     l2CacheData = static_cast<char*>(numa_alloc_onnode(l2_num_lines * PAGE_SIZE * CACHELINE, numa_max_node()));
     l2CacheControl = static_cast<control_data*>(numa_alloc_onnode(l2CacheControlSize, numa_max_node()));
-    l2_lru_counters = new std::uint32_t[l2_num_lines]();
+	// Should be on numa node as well
+	l2_lru_counters = static_cast<std::uint32_t*>(numa_alloc_onnode(sizeof(std::uint32_t)*l2_num_lines, numa_max_node()));
 	#endif
 
 	globalData = static_cast<char*>(vm::allocate_mappable(PAGE_SIZE, size_of_chunk));
@@ -1220,7 +1244,7 @@ void argo_finalize() {
     #ifdef ENABLE_L2
     numa_free(l2CacheData, l2_num_lines * PAGE_SIZE * CACHELINE);
     numa_free(l2CacheControl, align_forwards(sizeof(control_data) * l2_num_lines, PAGE_SIZE));
-    delete[] l2_lru_counters;
+    numa_free(l2_lru_counters, sizeof(std::uint32_t) * l2_num_lines);
     #endif
 	print_statistics();
 	#ifdef PRINT_L2
@@ -1262,7 +1286,7 @@ void argo_finalize() {
 		delete[] mpi_lock_sharer[i];
 	}
 	delete[] mpi_lock_sharer;
-
+	free(write_buffer_tags);
 	for(std::size_t i = 0; i < mpi_windows; i++) {
 		delete[] mpi_lock_data[i];
 	}
@@ -1441,6 +1465,7 @@ void argo_reset_coherence() {
 		cacheControl[i].tag = GLOBAL_NULL;
 		cacheControl[i].state = INVALID;
 		cacheControl[i].dirty = CLEAN;
+		write_buffer_tags[i] = GLOBAL_NULL; 
 	}
     #ifdef ENABLE_L2
     for(std::size_t i = 0; i < l2_num_lines; i++) {

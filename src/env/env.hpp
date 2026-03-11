@@ -90,6 +90,13 @@ std::size_t memory_size();
 std::size_t cache_size();
 
 /**
+ * @brief get the cache size requested by environment variable
+ * @return the requested cache size in bytes
+ * @see @ref ARGO_L2_ASSOC
+ */
+std::size_t l2_associativity();
+
+/**
  * @brief get the write buffer size requested by environment variable
  * @return the requested write buffer size in cache blocks
  * @see @ref ARGO_WRITE_BUFFER_SIZE

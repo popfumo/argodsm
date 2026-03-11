@@ -24,9 +24,14 @@
 #include "env/env.hpp"
 #include "qd.hpp"
 #include "virtual_memory/virtual_memory.hpp"
+#define ENABLE_L2
 
 /** @brief Block size based on backend definition */
 const std::size_t block_size = PAGE_SIZE*CACHELINE;
+#ifdef ENABLE_L2
+	extern std::uintptr_t* write_buffer_tags;
+	extern std::uintptr_t GLOBAL_NULL; 
+#endif
 
 /**
  * @brief	A write buffer in FIFO style with the capability to erase any
@@ -67,7 +72,6 @@ class write_buffer {
 		double _write_back_time{0};
 		/** @brief Statistic of time spent in the QD lock */
 		double _buffer_lock_time{0};
-
 		/**
 		 * @brief	Check if the write buffer is empty
 		 * @return	True if empty, else False
@@ -129,30 +133,47 @@ class write_buffer {
 		 * @pre		Require ibsem and cachemutex to be taken
 		 */
 		void write_back_index(std::size_t cache_index) {
+			#ifdef ENABLE_L2
+			//fprintf(stderr, "[DEADLOCK DBG] thread=%zu holding qd_lock, attempting cache_lock[%zu]\n",
+				//std::hash<std::thread::id>{}(std::this_thread::get_id()), cache_index);
+			#endif
 			cache_locks[cache_index].lock();
-			if(cacheControl[cache_index].dirty != DIRTY)
-			{
-				printf("cached page at index %lu was CLEAN during attempted writeback \n", cache_index);
-			}
-			assert(cacheControl[cache_index].dirty == DIRTY);
+			#ifdef ENABLE_L2
+				const auto expected_tag = write_buffer_tags[cache_index];
+				const auto current_tag  = cacheControl[cache_index].tag;
 
-			// if (cacheControl[cache_index].dirty != DIRTY ||
-			// 	cacheControl[cache_index].state == INVALID) {
-			// 	cache_locks[cache_index].unlock();
-			// 	return;
-			// }
+				// If this buffer entry is stale (index reused / evicted), skip silently
+				if (expected_tag == GLOBAL_NULL ||
+					expected_tag != current_tag ||
+					cacheControl[cache_index].state == INVALID) {
+					cache_locks[cache_index].unlock();
+					return;
+				}
 
-			const std::uintptr_t page_address = cacheControl[cache_index].tag;
-			void* page_ptr = static_cast<char*>(
-				argo::virtual_memory::start_address()) + page_address;
+				// Now we know this index still refers to the page that was enqueued
+				if (cacheControl[cache_index].dirty != DIRTY) {
+					// Page was cleaned by some other path, so this buffer entry is no longer responsible for any data
+					write_buffer_tags[cache_index] = GLOBAL_NULL;
+					cache_locks[cache_index].unlock();
+					return;
+				}
+			#else
+				assert(cacheControl[cache_index].dirty == DIRTY);
+			#endif
+            const std::uintptr_t page_address = cacheControl[cache_index].tag;
+            void* page_ptr = static_cast<char*>(
+                argo::virtual_memory::start_address()) + page_address;
 
-			// Write back the page
-			mprotect(page_ptr, block_size, PROT_READ);
-			cacheControl[cache_index].dirty = CLEAN;
-			for(std::size_t i = 0; i < CACHELINE; i++) {
-				storepageDIFF(cache_index+i, PAGE_SIZE*i+page_address);
-			}
-			cache_locks[cache_index].unlock();
+            // Write back the page
+            mprotect(page_ptr, block_size, PROT_READ);
+            cacheControl[cache_index].dirty = CLEAN;
+            #ifdef ENABLE_L2
+			write_buffer_tags[cache_index]  = GLOBAL_NULL;  // no longer enqueued
+			#endif
+            for(std::size_t i = 0; i < CACHELINE; i++) {
+                storepageDIFF(cache_index+i, PAGE_SIZE*i+page_address);
+            }
+            cache_locks[cache_index].unlock();
 		}
 
 		/**
@@ -163,10 +184,10 @@ class write_buffer {
 		void flush_partial() {
 			double t_start = MPI_Wtime();
 
-			// For each element, write back the corresponding ArgoDSM page
-			for(std::size_t i = 0; i < _write_back_size; i++) {
-				write_back_index(pop());
-			}
+			// For each element, write back the corresponding ArgoDSM page 
+            for(std::size_t i = 0; i < _write_back_size && !empty(); i++) {
+                write_back_index(pop());
+            }
 			double t_end = MPI_Wtime();
 
 			// Update timer statistics
@@ -191,15 +212,18 @@ class write_buffer {
 		 */
 		void _add(T val) {
 			// For debug builds, check for duplicate additions
-			assert(!has(val));
+			#ifndef ENABLE_L2
+			  assert(!has(val));
+			#endif
+			
 			// Does not contain actual data, just references to data. You need to be absolutely sure that buffer represents the actual state.
 			// When you evict
-			// if (has(val)) {
-			// 	return;
-			// }
+
 			
-			// If the buffer is full, write back _write_back_size indices
+			//If the buffer is full, write back _write_back_size indices
 			if(size() >= _max_size) {
+				// fprintf(stderr, "[DEADLOCK DBG] thread=%zu holding qd_lock, attempting flush_partial\n",
+    			// std::hash<std::thread::id>{}(std::this_thread::get_id()));
 				flush_partial();
 			}
 
