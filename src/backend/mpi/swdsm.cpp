@@ -31,18 +31,15 @@ namespace env = argo::env;
 
 #define ENABLE_L2
 // Introduce a synthetic latency for l1 misses to make l2 hits more visible in benchmarks
-//#define L1_NOOP
+#define L1_NOOP
 //#define PRINT_L2
 
-//#define S_PRINT
+#define S_PRINT
 /*Barrier*/
 /** @brief  Locks access to part that does SD in the global barrier */
 pthread_mutex_t barriermutex = PTHREAD_MUTEX_INITIALIZER;
 /** @brief Thread local barrier used to first wait for all local threads in the global barrier*/
 pthread_barrier_t *threadbarrier;
-
-static const std::size_t L2_PAGE_NOT_FOUND = -1;
-
 /*Pagecache*/
 /** @brief  Size of the cache in number of pages*/
 std::size_t cachesize;
@@ -65,6 +62,7 @@ char * pagecopy;
 /** @brief Pointer to locks protecting the page cache */
 std::vector<cache_lock> cache_locks;
 
+// TODO: Should evaluate if this is even necessary 
 std::uintptr_t* write_buffer_tags;
 
 #ifdef ENABLE_L2
@@ -75,15 +73,18 @@ char* l2CacheData;
 /** @brief Pointer to locks protecting the l2 page cache */
 // Sucks for high contention
 std::vector<cache_lock> l2_cache_locks;
-/** @brief Copy of the l2 cache to keep twinpages for later being able to DIFF stores */
-
+/** @brief L2 associativity */
 std::size_t L2_ASSOCIATIVITY;
+/** @brief Number of L2 sets */
 std::size_t l2_num_sets = 0;
+/** @brief Total number of lines in the L2 cache */
 std::size_t l2_num_lines = 0;
 /** @brief LRU counter per L2 line. Higher = more recently used */
 std::uint32_t* l2_lru_counters = nullptr;
 /** @brief Global LRU tick counter */
 std::uint32_t l2_lru_tick = 0;
+/** @brief Constant for indicating a page was not found in the L2 cache */
+static const std::size_t L2_PAGE_NOT_FOUND = -1;
 #endif
 /** @brief Mutex ensuring that only one thread can perform node-wide synchronization */
 std::shared_mutex sync_lock;
@@ -206,7 +207,7 @@ inline void l2_touch(std::size_t idx) {
  * @brief Find a line in an L2 set matching the given tag
  * @param set The set number
  * @param tag The address tag to search for
- * @return The L2 line index, or (size_t)-1 if not found
+ * @return The L2 line index, or L2_PAGE_NOT_FOUND if not found
  * @pre All locks for ways in this set should be held
  */
 inline std::size_t l2_find_line(std::size_t set, std::uintptr_t tag) {
@@ -418,9 +419,10 @@ void load_cache_entry(std::uintptr_t aligned_access_offset) {
 	#ifdef ENABLE_L2
 	// TODO: Use malloc instead. 
 	std::vector<char> temp_l2_data(fetch_size*PAGE_SIZE);
-	#endif
 	/* Per-page L2 index found during lookup, valid only when l2_hit[p] is true */
-    std::vector<std::size_t> l2_hit_idx(fetch_size, static_cast<std::size_t>(-1));
+    std::vector<std::size_t> l2_hit_idx(fetch_size, L2_PAGE_NOT_FOUND);
+	#endif
+
     /* Per-page L2 set, valid only when l2_hit[p] is true.
      * The set lock is HELD from lookup until promotion completes. */
     std::vector<std::size_t> l2_hit_set(fetch_size, 0);
@@ -438,7 +440,7 @@ void load_cache_entry(std::uintptr_t aligned_access_offset) {
             }
 #ifdef ENABLE_L2
             /* Check if the page is in L2 using set-associative lookup.
-             * If found, KEEP the set lock held to prevent races during promotion. */
+             * If found, copy the data to tmp buffer. */
             {
                 const std::size_t l2_set = l2_get_set_from_addr(temp_addr);
                 l2_lock_set(l2_set);
@@ -456,7 +458,7 @@ void load_cache_entry(std::uintptr_t aligned_access_offset) {
                     pages_to_load[p] = true;
                     ++local_remote_misses;
                 }
-				l2_unlock_set(l2_set);  // release set lock immediately since we only needed it for the lookup
+				l2_unlock_set(l2_set); 
             }
 #else		
 			else {
@@ -480,17 +482,21 @@ void load_cache_entry(std::uintptr_t aligned_access_offset) {
             {
                 bool l1_dirty = (cacheControl[idx].dirty == DIRTY);
 				// Should also probably check if it's invalid...?
-                if(l1_dirty) {
+				bool l1_valid = (cacheControl[idx].state != INVALID);
+                if(l1_dirty && l1_valid) {
                     // Dirty victims are written back directly
                     mprotect(old_ptr, block_size, PROT_READ);
                     for(std::size_t j = 0; j < CACHELINE; j++) {
                         storepageDIFF(idx+j, PAGE_SIZE*j + cacheControl[idx].tag);
                     }
-					// This is extremely suspect, uncommenting this line and enabling L2 causes a deadlock.
-					// Probable reason is that the thread that holds the QD lock is waiting for the thread that delegated it
-					// fprintf(stderr, "[DEADLOCK DBG] thread=%zu holding cache_lock[%zu], attempting write_buffer erase\n",
-    				// std::hash<std::thread::id>{}(std::this_thread::get_id()), idx);
-                    // argo_write_buffer->erase(idx);
+					// Attempting to erase the write buffer entry causes a deadlock
+					// Probable cause is that the thread that holds the QD lock is waiting for the thread that delegated it
+					// to release the cache lock that it tries
+					//fprintf(stderr, "[DEADLOCK DBG] thread=%zu holding cache_lock[%zu], attempting write_buffer erase\n",
+    				//std::hash<std::thread::id>{}(std::this_thread::get_id()), idx);
+                    //argo_write_buffer->erase(idx);
+					//fprintf(stderr, "[DEADLOCK DBG] thread=%zu holding cache_lock[%zu], finished write_buffer erase\n",
+					//std::hash<std::thread::id>{}(std::this_thread::get_id()), idx);
                 } else {
                     // Clean victims are inserted into L2 using set-associative placement
                     const std::uintptr_t old_tag = cacheControl[idx].tag;
@@ -530,7 +536,7 @@ void load_cache_entry(std::uintptr_t aligned_access_offset) {
                 }
             }
 #else
-            if(cacheControl[idx].dirty == DIRTY) {
+            if(cacheControl[idx].dirty == DIRTY && cacheControl[idx].state != INVALID) {
                 mprotect(old_ptr, block_size, PROT_READ);
                 for(std::size_t j = 0; j < CACHELINE; j++) {
                     storepageDIFF(idx+j, PAGE_SIZE*j + cacheControl[idx].tag);
@@ -683,14 +689,13 @@ for(std::size_t idx = start_index, p = 0; idx < end_index; idx+=CACHELINE, p+=CA
             cacheControl[idx].dirty = CLEAN;
             /* Unlock every lock but that for start_index */
 			#ifdef L1_NOOP
-			// Simulate RDMA network latency for remote page fetches.
-			// Only delays pages actually fetched remotely (not L2 hits).
-			// Uses nanosleep to avoid burning CPU (real RDMA is NIC-offloaded).
-			// ~20µs approximates: sharer directory ops + MPI_Get + unlock on InfiniBand.
+			// Simulate RDMA network latency for remote page fetches
+			// Only delays pages actually fetched remotely (not L2 hits)
+			// 15 us approximates: sharer directory ops + MPI_Get + unlock on InfiniBand
 			if(local_remote_misses > 0) {
 				struct timespec ts;
 				ts.tv_sec = 0;
-				ts.tv_nsec = 20000;  // 20 µs
+				ts.tv_nsec = 15000;  
 				nanosleep(&ts, nullptr);
 			}
 			#endif
@@ -706,8 +711,8 @@ for(std::size_t idx = start_index, p = 0; idx < end_index; idx+=CACHELINE, p+=CA
             memcpy(&cacheData[idx*block_size],
                    &temp_l2_data[p*block_size],
                    block_size);
-			// Don't use void pointer
-            char* temp_ptr = static_cast<char*>(startAddr) + temp_addr;
+
+			char* temp_ptr = static_cast<char*>(startAddr) + temp_addr;
 
             if(cacheControl[idx].tag == GLOBAL_NULL) {
                 vm::map_memory(temp_ptr, block_size, PAGE_SIZE*idx, PROT_READ);
@@ -1307,9 +1312,6 @@ void argo_finalize() {
 void self_invalidation() {
 	int flushed = 0;
 	std::uint64_t id = static_cast<std::uint64_t>(1) << workrank;
-	#ifdef PRINT_L2
-	printf("Node %u: Invalidation reached \n", workrank);
-	#endif
 	double t1 = MPI_Wtime();
 	for(std::size_t i = 0; i < cachesize; i += CACHELINE) {
 		if(touchedcache[i] != 0) {
@@ -1402,7 +1404,7 @@ void self_upgrade(argo::backend::upgrade_type upgrade) {
                 {
                     const std::size_t l2_set = l2_get_set_from_addr(page_addr);
                     std::size_t l2_idx = l2_find_line(l2_set, page_addr);
-                    if(l2_idx != static_cast<std::size_t>(-1)) {
+                    if(l2_idx != L2_PAGE_NOT_FOUND) {
                         l2CacheControl[l2_idx].dirty = CLEAN;
                         l2CacheControl[l2_idx].state = INVALID;
                     }
@@ -1894,7 +1896,8 @@ bool _is_cached(std::uintptr_t addr) {
     }
     const std::size_t l2_set = l2_get_set_from_addr(aligned_address);
     std::size_t l2_idx = l2_find_line(l2_set, aligned_address);
-    return (l2_idx != static_cast<std::size_t>(-1));
+	// We are checking the validity of the line inside the function, no need to check tag here
+    return (l2_idx != L2_PAGE_NOT_FOUND);
 	#else
     return ((homenode == workrank) || (cacheControl[cache_index].tag == aligned_address &&
                 cacheControl[cache_index].state == VALID));

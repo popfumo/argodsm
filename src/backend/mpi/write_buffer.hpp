@@ -24,14 +24,14 @@
 #include "env/env.hpp"
 #include "qd.hpp"
 #include "virtual_memory/virtual_memory.hpp"
-#define ENABLE_L2
+//#define ENABLE_L2
 
 /** @brief Block size based on backend definition */
 const std::size_t block_size = PAGE_SIZE*CACHELINE;
-#ifdef ENABLE_L2
+
 	extern std::uintptr_t* write_buffer_tags;
 	extern std::uintptr_t GLOBAL_NULL; 
-#endif
+
 
 /**
  * @brief	A write buffer in FIFO style with the capability to erase any
@@ -134,32 +134,29 @@ class write_buffer {
 		 */
 		void write_back_index(std::size_t cache_index) {
 			#ifdef ENABLE_L2
-			//fprintf(stderr, "[DEADLOCK DBG] thread=%zu holding qd_lock, attempting cache_lock[%zu]\n",
-				//std::hash<std::thread::id>{}(std::this_thread::get_id()), cache_index);
+			// fprintf(stderr, "[DEADLOCK DBG] thread=%zu holding qd_lock, attempting cache_lock[%zu]\n",
+			// 	std::hash<std::thread::id>{}(std::this_thread::get_id()), cache_index);
 			#endif
 			cache_locks[cache_index].lock();
-			#ifdef ENABLE_L2
-				const auto expected_tag = write_buffer_tags[cache_index];
-				const auto current_tag  = cacheControl[cache_index].tag;
+				// const auto expected_tag = write_buffer_tags[cache_index];
+				// const auto current_tag  = cacheControl[cache_index].tag;
 
 				// If this buffer entry is stale (index reused / evicted), skip silently
-				if (expected_tag == GLOBAL_NULL ||
-					expected_tag != current_tag ||
-					cacheControl[cache_index].state == INVALID) {
-					cache_locks[cache_index].unlock();
-					return;
-				}
+				// if (expected_tag == GLOBAL_NULL ||
+				// 	expected_tag != current_tag ||
+				// 	cacheControl[cache_index].state == INVALID) {
+				// 	cache_locks[cache_index].unlock();
+				// 	return;
+				// }
 
-				// Now we know this index still refers to the page that was enqueued
-				if (cacheControl[cache_index].dirty != DIRTY) {
-					// Page was cleaned by some other path, so this buffer entry is no longer responsible for any data
-					write_buffer_tags[cache_index] = GLOBAL_NULL;
-					cache_locks[cache_index].unlock();
-					return;
-				}
-			#else
-				assert(cacheControl[cache_index].dirty == DIRTY);
-			#endif
+				// // Now we know this index still refers to the page that was enqueued
+				// if (cacheControl[cache_index].dirty != DIRTY) {
+				// 	// Page was cleaned by some other path, so this buffer entry is no longer responsible for any data
+				// 	write_buffer_tags[cache_index] = GLOBAL_NULL;
+				// 	cache_locks[cache_index].unlock();
+				// 	return;
+				// }
+			assert(cacheControl[cache_index].dirty == DIRTY);
             const std::uintptr_t page_address = cacheControl[cache_index].tag;
             void* page_ptr = static_cast<char*>(
                 argo::virtual_memory::start_address()) + page_address;
@@ -185,7 +182,7 @@ class write_buffer {
 			double t_start = MPI_Wtime();
 
 			// For each element, write back the corresponding ArgoDSM page 
-            for(std::size_t i = 0; i < _write_back_size && !empty(); i++) {
+            for(std::size_t i = 0; i < _write_back_size; i++) {
                 write_back_index(pop());
             }
 			double t_end = MPI_Wtime();
@@ -212,14 +209,9 @@ class write_buffer {
 		 */
 		void _add(T val) {
 			// For debug builds, check for duplicate additions
-			#ifndef ENABLE_L2
-			  assert(!has(val));
-			#endif
+			assert(!has(val));
 			
 			// Does not contain actual data, just references to data. You need to be absolutely sure that buffer represents the actual state.
-			// When you evict
-
-			
 			//If the buffer is full, write back _write_back_size indices
 			if(size() >= _max_size) {
 				// fprintf(stderr, "[DEADLOCK DBG] thread=%zu holding qd_lock, attempting flush_partial\n",
