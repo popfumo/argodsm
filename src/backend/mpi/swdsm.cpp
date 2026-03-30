@@ -47,6 +47,10 @@ argo_byte * touchedcache;
 char* cacheData;
 /** @brief Copy of the local cache to keep twinpages for later being able to DIFF stores */
 char * pagecopy;
+/** @brief Inflight page copy counter */
+std::atomic<std::size_t> inflight_copies;
+/** @brief  Maximum number of inflight copies during run */
+std::atomic<std::size_t> max_inflight_copies;
 /** @brief Pointer to locks protecting the page cache */
 std::vector<cache_lock> cache_locks;
 /** @brief Mutex ensuring that only one thread can perform node-wide synchronization */
@@ -679,6 +683,19 @@ void handler(int sig, siginfo_t *si, void *context) {
 	}
 	unsigned char* copy = reinterpret_cast<unsigned char*>(pagecopy + line*PAGE_SIZE);
 	memcpy(copy, aligned_access_ptr, PAGE_SIZE*CACHELINE);
+	const std::size_t delta = CACHELINE;
+
+    // increment global in-flight counter
+    auto current = inflight_copies.fetch_add(delta, std::memory_order_relaxed) + delta;
+
+    // atomically update max_inflight_copies
+    auto prev_max = max_inflight_copies.load(std::memory_order_relaxed);
+    while (current > prev_max &&
+           !max_inflight_copies.compare_exchange_weak(
+               prev_max, current,
+               std::memory_order_relaxed,
+               std::memory_order_relaxed)) {
+    }
 	mprotect(aligned_access_ptr, PAGE_SIZE*CACHELINE, PROT_WRITE|PROT_READ);
 	cache_locks[startIndex].unlock();
 	double t2 = MPI_Wtime();
@@ -1205,6 +1222,7 @@ void storepageDIFF(std::size_t index, std::uintptr_t addr) {
 
 	mpi_lock_data[win_index][homenode].unlock(homenode, data_windows[win_index][homenode]);
 	stats.write_misses.fetch_add(1);
+	inflight_copies.fetch_sub(1);
 }
 
 /** @brief Red color for statistics output */
@@ -1378,7 +1396,7 @@ void print_statistics() {
 						stats.read_misses.load(), stats.load_time);
 				printf("#  write misses: %11lu    access time: %12.4fs\n",
 						stats.write_misses.load(), stats.store_time);
-
+				printf("#  max in-flight copies: %zu\n", max_inflight_copies.load());
 				/* Print coherence info */
 				printf("#  " CYN "# Coherence actions\n" RESET);
 				printf("#  locks held: %13d    barriers passed: %8lu    barrier time: %11.4fs\n",

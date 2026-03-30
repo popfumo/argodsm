@@ -11,6 +11,8 @@
 #include <sys/statvfs.h>
 #include <sys/types.h>
 #include <unistd.h>
+#include <numa.h>
+
 // C++ headers
 #include <cerrno>
 #include <cstddef>
@@ -75,6 +77,16 @@ void* start_address() {
 
 std::size_t size() {
 	return avail;
+}
+
+void* allocate_mappable_cxl(std::size_t size)
+{
+	void* p = numa_alloc_onnode(size, 2);
+	if(p == nullptr) {
+		std::cerr << msg_alloc_fail << std::endl;
+		return nullptr;
+	}
+	return p;
 }
 
 void* allocate_mappable(std::size_t alignment, std::size_t size) {

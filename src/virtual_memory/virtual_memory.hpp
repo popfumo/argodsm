@@ -40,6 +40,9 @@ std::size_t size();
  *          Any memory allocated through other means may not be possible to map
  *          into the visible ArgoDSM virtual memory space later.
  */
+
+ void* allocate_mappable_cxl(std::size_t size);
+
 void* allocate_mappable(std::size_t alignment, std::size_t size);
 
 /**
