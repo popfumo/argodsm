@@ -70,6 +70,12 @@ const std::size_t default_mpi_windows_per_node = 4;
 const std::size_t default_print_statistics = 2;  // default 2 is basic node statistics
 
 /**
+ * @brief default requested l2 associativity (if environment variable is unset)
+ * @see @ref ARGO_L2_ASSOC
+ */
+const std::size_t default_l2_associativity = 2; 
+
+/**
  * @brief environment variable used for requesting memory size
  * @see @ref ARGO_MEMORY_SIZE
  */
@@ -80,6 +86,12 @@ const std::string env_memory_size = "ARGO_MEMORY_SIZE";
  * @see @ref ARGO_CACHE_SIZE
  */
 const std::string env_cache_size = "ARGO_CACHE_SIZE";
+
+/**
+ * @brief environment variable used for requesting l2 cache associativity
+ * @see @ref ARGO_L2_ASSOC
+ */
+const std::string env_l2_associativity = "ARGO_L2_ASSOC";
 
 /**
  * @brief environment variable used for requesting write buffer size
@@ -140,6 +152,11 @@ std::size_t value_memory_size;
  * @brief cache size requested through the environment variable @ref ARGO_CACHE_SIZE
  */
 std::size_t value_cache_size;
+
+/**
+ * @brief L2 associativity requested through the environment variable @ref ARGO_L2_ASSOC
+ */
+std::size_t value_l2_associativity;
 
 /**
  * @brief write buffer size requested through the environment variable @ref ARGO_WRITE_BUFFER_SIZE
@@ -243,7 +260,7 @@ void init() {
 	value_load_size = parse_env<std::size_t>(env_load_size, default_load_size).second;
 	value_mpi_windows_per_node = parse_env<std::size_t>(env_mpi_windows_per_node, default_mpi_windows_per_node).second;
 	value_print_statistics = parse_env<std::size_t>(env_print_statistics, default_print_statistics).second;
-
+	value_l2_associativity = parse_env<std::size_t>(env_l2_associativity, default_l2_associativity).second;
 	is_initialized = true;
 }
 
@@ -255,6 +272,11 @@ std::size_t memory_size() {
 std::size_t cache_size() {
 	assert_initialized();
 	return value_cache_size;
+}
+
+std::size_t l2_associativity() {
+	assert_initialized();
+	return value_l2_associativity;
 }
 
 std::size_t write_buffer_size() {
